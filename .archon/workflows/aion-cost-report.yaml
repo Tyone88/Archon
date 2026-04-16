@@ -1,0 +1,107 @@
+name: aion-cost-report
+description: |
+  Use when: Checking API costs and generating a cost report.
+  Triggers: "cost report", "how much are we spending", "API costs",
+            "Anthropic spend", "check costs", "billing report".
+  NOT for: Full platform audit (use aion-audit).
+
+  Cost analysis pipeline:
+  1. Gather cost data from costTracker.js across all bots
+  2. Gather bot conversation stats for ROI context
+  3. AI narrative summary with recommendations
+  4. Telegram report
+
+  Safety: 100% read-only. No mutations.
+
+provider: claude
+model: haiku
+
+nodes:
+  - id: gather-costs
+    bash: |
+      echo "=== API COST DATA ==="
+      echo ""
+
+      # Run cost tracker if it exists
+      if [ -f "/root/aion-core/scripts/costTracker.js" ]; then
+        echo "--- Cost Tracker Output ---"
+        node /root/aion-core/scripts/costTracker.js 2>&1 || echo "costTracker.js failed"
+        echo ""
+      fi
+
+      # Check each bot's conversation volume
+      echo "--- BOT CONVERSATION COUNTS (last 7 days) ---"
+      for ENTRY in "/root/gulf-agent/data/gulf.db|Gulf|conversations" "/root/giovanni-bot/data/giovanni.db|Giovanni|conversations" "/root/boxette-bot/data/boxette.db|Boxette|conversations" "/root/automenu-bot/data/automenu.db|AutoMenu|conversations" "/root/atlas-bot/data/atlas-bot.db|Atlas Bot|conversations" "/root/sharon-bot/data/sharon.db|Sharon|conversations"; do
+        DB_PATH=$(echo "$ENTRY" | cut -d'|' -f1)
+        DB_NAME=$(echo "$ENTRY" | cut -d'|' -f2)
+        TABLE=$(echo "$ENTRY" | cut -d'|' -f3)
+
+        if [ -f "$DB_PATH" ]; then
+          COUNT_7D=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM $TABLE WHERE created_at > datetime('now', '-7 days');" 2>/dev/null || echo "0")
+          COUNT_TOTAL=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM $TABLE;" 2>/dev/null || echo "0")
+          echo "  $DB_NAME: $COUNT_7D (7d) / $COUNT_TOTAL (total)"
+        else
+          echo "  $DB_NAME: DB not found"
+        fi
+      done
+      echo ""
+
+      # Atlas Base events
+      echo "--- ATLAS BASE EVENTS (7 days) ---"
+      if [ -f "/root/aios-command-center-aion/data/atlas.db" ]; then
+        EVENTS_7D=$(sqlite3 /root/aios-command-center-aion/data/atlas.db "SELECT COUNT(*) FROM events WHERE created_at > datetime('now', '-7 days');" 2>/dev/null || echo "0")
+        echo "  Events: $EVENTS_7D"
+      fi
+      echo ""
+
+      # SEO Centre activity
+      echo "--- SEO CENTRE (7 days) ---"
+      if [ -f "/root/aion-seo-centre/data/seo.db" ]; then
+        GEO_7D=$(sqlite3 /root/aion-seo-centre/data/seo.db "SELECT COUNT(*) FROM geo_checks WHERE checked_at > datetime('now', '-7 days');" 2>/dev/null || echo "0")
+        CONTENT_7D=$(sqlite3 /root/aion-seo-centre/data/seo.db "SELECT COUNT(*) FROM ai_content WHERE created_at > datetime('now', '-7 days');" 2>/dev/null || echo "0")
+        echo "  GEO checks: $GEO_7D | AI content: $CONTENT_7D"
+      fi
+    timeout: 30000
+
+  - id: narrative
+    prompt: |
+      You are generating a weekly cost and activity report for Aion Development Partners.
+
+      Here is the raw data:
+      $gather-costs.output
+
+      Write a concise executive summary (5-8 lines) covering:
+      1. Total API spend breakdown by service (if available from costTracker)
+      2. Bot activity levels — which bots are busiest, which are idle
+      3. SEO Centre usage
+      4. Any cost concerns or anomalies
+      5. One recommendation to optimize costs
+
+      Format as plain text, no markdown. Short sentences. Direct. Like a CFO briefing.
+      If cost data is unavailable, focus on activity volume as a proxy.
+    depends_on: [gather-costs]
+    model: haiku
+    allowed_tools: []
+
+  - id: report
+    bash: |
+      echo "=== SENDING COST REPORT ==="
+
+      TEXT="*Weekly Cost Report*
+
+      $narrative.output
+
+      _Archon aion-cost-report workflow_"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      echo "Report sent."
+      echo ""
+      echo "$gather-costs.output"
+      echo ""
+      echo "$narrative.output"
+    depends_on: [narrative]
+    timeout: 15000

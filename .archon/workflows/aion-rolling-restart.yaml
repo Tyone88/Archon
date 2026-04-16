@@ -1,0 +1,178 @@
+name: aion-rolling-restart
+description: |
+  Use when: Restarting multiple PM2 services safely after code changes or config updates.
+  Triggers: "rolling restart", "restart services", "restart the fleet",
+            "coordinated restart", "restart after deploy".
+  NOT for: Single-repo deploys (use aion-deploy), Sage restarts (NEVER).
+
+  Safe rolling restart pipeline:
+  1. Pre-check — verify token isolation and PM2 env are clean
+  2. Human approval with service list
+  3. Restart each service one at a time with 5s pause and health verification
+  4. Post-restart verification + Telegram report
+
+  Input: $1 = comma-separated PM2 process names, or "all-bots", or "all-apis"
+  Safety: Human approval required. Uses safe-restart.sh. NEVER touches sage-eternity.
+
+provider: claude
+model: haiku
+interactive: true
+
+nodes:
+  - id: pre-check
+    bash: |
+      echo "=== ROLLING RESTART PRE-CHECK ==="
+      echo "Requested: $1"
+      echo ""
+
+      # Resolve service list
+      INPUT="$1"
+      if [ "$INPUT" = "all-bots" ]; then
+        SERVICES="gulf-agent giovanni-bot boxette-bot automenu-bot atlas-bot sharon-bot"
+      elif [ "$INPUT" = "all-apis" ]; then
+        SERVICES="aion-frontend aion-seo-centre aion-dashboard-api"
+      elif [ "$INPUT" = "all-frontends" ]; then
+        SERVICES="cc-frontend-premium aion-seo-frontend aion-dashboard"
+      else
+        SERVICES=$(echo "$INPUT" | tr ',' ' ')
+      fi
+
+      echo "Services to restart: $SERVICES"
+      echo ""
+
+      # Sacred guard
+      for SVC in $SERVICES; do
+        if [ "$SVC" = "sage-eternity" ]; then
+          echo "FAIL: REFUSED — sage-eternity is SACRED. Remove it from the list."
+          exit 1
+        fi
+      done
+
+      # Current status of each service
+      echo "--- CURRENT STATUS ---"
+      for SVC in $SERVICES; do
+        INFO=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          if p['name']=='$SVC':
+              env=p.get('pm2_env',{})
+              mem=p.get('monit',{}).get('memory',0)//(1024*1024)
+              print(f'{env.get(\"status\",\"unknown\")}|{mem}MB|{env.get(\"restart_time\",0)} restarts')
+              sys.exit(0)
+      print('not_found|0MB|0 restarts')
+      " 2>/dev/null)
+        echo "  $SVC: $INFO"
+      done
+      echo ""
+
+      # Token + env checks
+      echo "--- TOKEN ISOLATION ---"
+      node /root/aion-core/scripts/verify-tokens.js 2>&1
+      echo ""
+      echo "--- PM2 ENV AUDIT ---"
+      node /root/aion-core/scripts/pm2-env-audit.js 2>&1
+      echo ""
+
+      echo "SERVICES=$SERVICES"
+      echo "PRE_CHECK=PASS"
+    timeout: 30000
+
+  - id: approval
+    approval:
+      message: |
+        Rolling restart pre-check complete.
+
+        $pre-check.output
+
+        Approve to restart all listed services one at a time with health verification.
+      capture_response: true
+    depends_on: [pre-check]
+
+  - id: restart
+    bash: |
+      echo "=== ROLLING RESTART ==="
+
+      SERVICES=$(echo "$pre-check.output" | grep "^SERVICES=" | cut -d= -f2-)
+
+      RESTART_OK=0
+      RESTART_FAIL=0
+
+      for SVC in $SERVICES; do
+        echo ""
+        echo "--- Restarting: $SVC ---"
+
+        # Safe restart
+        bash /root/aion-core/scripts/safe-restart.sh "$SVC" 2>&1
+
+        # Wait for stabilization
+        echo "  Waiting 5 seconds..."
+        sleep 5
+
+        # Verify online
+        STATUS=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          if p['name']=='$SVC':
+              print(p.get('pm2_env',{}).get('status','unknown'))
+              sys.exit(0)
+      print('not_found')
+      " 2>/dev/null)
+
+        if [ "$STATUS" = "online" ]; then
+          echo "  $SVC: ONLINE"
+          RESTART_OK=$((RESTART_OK + 1))
+        else
+          echo "  $SVC: *** $STATUS *** — PROBLEM"
+          RESTART_FAIL=$((RESTART_FAIL + 1))
+        fi
+      done
+
+      echo ""
+      echo "RESTART_OK=$RESTART_OK"
+      echo "RESTART_FAIL=$RESTART_FAIL"
+
+      if [ "$RESTART_FAIL" -gt 0 ]; then
+        echo "RESTART_STATUS=FAIL"
+      else
+        echo "RESTART_STATUS=PASS"
+      fi
+    depends_on: [approval]
+    timeout: 300000
+
+  - id: verify-report
+    bash: |
+      echo "=== POST-RESTART VERIFICATION ==="
+
+      # Token + env
+      node /root/aion-core/scripts/verify-tokens.js 2>&1
+      TOKEN_OK=$?
+      node /root/aion-core/scripts/pm2-env-audit.js 2>&1
+      ENV_OK=$?
+
+      R_OK=$(echo "$restart.output" | grep "^RESTART_OK=" | cut -d= -f2)
+      R_FAIL=$(echo "$restart.output" | grep "^RESTART_FAIL=" | cut -d= -f2)
+
+      OVERALL="PASS"
+      if [ "$TOKEN_OK" -ne 0 ] || [ "$ENV_OK" -ne 0 ] || [ "${R_FAIL:-0}" -gt 0 ]; then
+        OVERALL="FAIL"
+      fi
+
+      TEXT="*Rolling Restart Complete*
+
+      Restarted: ${R_OK:-0} OK, ${R_FAIL:-0} failed
+      Token Check: $([ $TOKEN_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+      Env Audit: $([ $ENV_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+      Status: *$OVERALL*
+
+      _Archon aion-rolling-restart workflow_"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      echo "ROLLING_RESTART=$OVERALL"
+    depends_on: [restart]
+    timeout: 30000

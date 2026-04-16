@@ -1,0 +1,281 @@
+name: aion-bot-tests
+description: |
+  Use when: Running all bot test suites in parallel for quick fleet validation.
+  Triggers: "run all bot tests", "test the fleet", "bot tests", "pre-deploy tests",
+            "are the bots healthy", "vitest all bots".
+  NOT for: Full platform audit (use aion-audit), single-repo deploys (use aion-deploy).
+
+  Runs vitest on all 6 bots in parallel (Gulf, Giovanni, Boxette, AutoMenu, Atlas, Sharon).
+  Pure bash — no AI, no mutations, just test execution.
+  AI synthesis at the end scores fleet health.
+  Telegram report with total pass/fail.
+
+  Safety: 100% read-only. Tests use in-memory SQLite. No production impact.
+
+provider: claude
+model: haiku
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # 6 PARALLEL TEST RUNNERS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: test-gulf
+    bash: |
+      echo "=== GULF AGENT TESTS ==="
+      cd /root/gulf-agent
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ]; then
+        OUTPUT=$(npx vitest run --reporter=verbose 2>&1)
+        echo "$OUTPUT" | tail -20
+        PASSED=$(echo "$OUTPUT" | grep -oP '\d+(?= passed)' | head -1)
+        FAILED=$(echo "$OUTPUT" | grep -oP '\d+(?= failed)' | head -1)
+        PASSED=${PASSED:-0}
+        FAILED=${FAILED:-0}
+        TOTAL=$((PASSED + FAILED))
+        echo ""
+        echo "BOT=gulf"
+        echo "PASSED=$PASSED"
+        echo "FAILED=$FAILED"
+        echo "TOTAL=$TOTAL"
+        if [ "$FAILED" -gt 0 ]; then
+          echo "STATUS=FAIL"
+          exit 1
+        else
+          echo "STATUS=PASS"
+        fi
+      else
+        echo "BOT=gulf"
+        echo "STATUS=SKIP (no vitest config)"
+      fi
+    timeout: 120000
+
+  - id: test-giovanni
+    bash: |
+      echo "=== GIOVANNI BOT TESTS ==="
+      cd /root/giovanni-bot
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ]; then
+        OUTPUT=$(npx vitest run --reporter=verbose 2>&1)
+        echo "$OUTPUT" | tail -20
+        PASSED=$(echo "$OUTPUT" | grep -oP '\d+(?= passed)' | head -1)
+        FAILED=$(echo "$OUTPUT" | grep -oP '\d+(?= failed)' | head -1)
+        PASSED=${PASSED:-0}
+        FAILED=${FAILED:-0}
+        TOTAL=$((PASSED + FAILED))
+        echo ""
+        echo "BOT=giovanni"
+        echo "PASSED=$PASSED"
+        echo "FAILED=$FAILED"
+        echo "TOTAL=$TOTAL"
+        if [ "$FAILED" -gt 0 ]; then
+          echo "STATUS=FAIL"
+          exit 1
+        else
+          echo "STATUS=PASS"
+        fi
+      else
+        echo "BOT=giovanni"
+        echo "STATUS=SKIP (no vitest config)"
+      fi
+    timeout: 120000
+
+  - id: test-boxette
+    bash: |
+      echo "=== BOXETTE BOT TESTS ==="
+      cd /root/boxette-bot
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ]; then
+        OUTPUT=$(npx vitest run --reporter=verbose 2>&1)
+        echo "$OUTPUT" | tail -20
+        PASSED=$(echo "$OUTPUT" | grep -oP '\d+(?= passed)' | head -1)
+        FAILED=$(echo "$OUTPUT" | grep -oP '\d+(?= failed)' | head -1)
+        PASSED=${PASSED:-0}
+        FAILED=${FAILED:-0}
+        TOTAL=$((PASSED + FAILED))
+        echo ""
+        echo "BOT=boxette"
+        echo "PASSED=$PASSED"
+        echo "FAILED=$FAILED"
+        echo "TOTAL=$TOTAL"
+        if [ "$FAILED" -gt 0 ]; then
+          echo "STATUS=FAIL"
+          exit 1
+        else
+          echo "STATUS=PASS"
+        fi
+      else
+        echo "BOT=boxette"
+        echo "STATUS=SKIP (no vitest config)"
+      fi
+    timeout: 120000
+
+  - id: test-automenu
+    bash: |
+      echo "=== AUTOMENU BOT TESTS ==="
+      cd /root/automenu-bot
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ]; then
+        OUTPUT=$(npx vitest run --reporter=verbose 2>&1)
+        echo "$OUTPUT" | tail -20
+        PASSED=$(echo "$OUTPUT" | grep -oP '\d+(?= passed)' | head -1)
+        FAILED=$(echo "$OUTPUT" | grep -oP '\d+(?= failed)' | head -1)
+        PASSED=${PASSED:-0}
+        FAILED=${FAILED:-0}
+        TOTAL=$((PASSED + FAILED))
+        echo ""
+        echo "BOT=automenu"
+        echo "PASSED=$PASSED"
+        echo "FAILED=$FAILED"
+        echo "TOTAL=$TOTAL"
+        if [ "$FAILED" -gt 0 ]; then
+          echo "STATUS=FAIL"
+          exit 1
+        else
+          echo "STATUS=PASS"
+        fi
+      else
+        echo "BOT=automenu"
+        echo "STATUS=SKIP (no vitest config)"
+      fi
+    timeout: 120000
+
+  - id: test-atlas
+    bash: |
+      echo "=== ATLAS BOT TESTS ==="
+      cd /root/atlas-bot
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ]; then
+        OUTPUT=$(npx vitest run --reporter=verbose 2>&1)
+        echo "$OUTPUT" | tail -20
+        PASSED=$(echo "$OUTPUT" | grep -oP '\d+(?= passed)' | head -1)
+        FAILED=$(echo "$OUTPUT" | grep -oP '\d+(?= failed)' | head -1)
+        PASSED=${PASSED:-0}
+        FAILED=${FAILED:-0}
+        TOTAL=$((PASSED + FAILED))
+        echo ""
+        echo "BOT=atlas"
+        echo "PASSED=$PASSED"
+        echo "FAILED=$FAILED"
+        echo "TOTAL=$TOTAL"
+        if [ "$FAILED" -gt 0 ]; then
+          echo "STATUS=FAIL"
+          exit 1
+        else
+          echo "STATUS=PASS"
+        fi
+      else
+        echo "BOT=atlas"
+        echo "STATUS=SKIP (no vitest config)"
+      fi
+    timeout: 120000
+
+  - id: test-sharon
+    bash: |
+      echo "=== SHARON BOT TESTS ==="
+      cd /root/sharon-bot
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ]; then
+        OUTPUT=$(npx vitest run --reporter=verbose 2>&1)
+        echo "$OUTPUT" | tail -20
+        PASSED=$(echo "$OUTPUT" | grep -oP '\d+(?= passed)' | head -1)
+        FAILED=$(echo "$OUTPUT" | grep -oP '\d+(?= failed)' | head -1)
+        PASSED=${PASSED:-0}
+        FAILED=${FAILED:-0}
+        TOTAL=$((PASSED + FAILED))
+        echo ""
+        echo "BOT=sharon"
+        echo "PASSED=$PASSED"
+        echo "FAILED=$FAILED"
+        echo "TOTAL=$TOTAL"
+        if [ "$FAILED" -gt 0 ]; then
+          echo "STATUS=FAIL"
+          exit 1
+        else
+          echo "STATUS=PASS"
+        fi
+      else
+        echo "BOT=sharon"
+        echo "STATUS=SKIP (no vitest config)"
+      fi
+    timeout: 120000
+
+  # ═══════════════════════════════════════════════════════════════
+  # SYNTHESIS + REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: summarize
+    bash: |
+      echo "=== BOT FLEET TEST SUMMARY ==="
+      echo ""
+
+      TOTAL_PASSED=0
+      TOTAL_FAILED=0
+      BOTS_PASS=0
+      BOTS_FAIL=0
+      BOTS_SKIP=0
+
+      for NODE_OUTPUT in "$test-gulf.output" "$test-giovanni.output" "$test-boxette.output" "$test-automenu.output" "$test-atlas.output" "$test-sharon.output"; do
+        BOT=$(echo "$NODE_OUTPUT" | grep "^BOT=" | cut -d= -f2)
+        STATUS=$(echo "$NODE_OUTPUT" | grep "^STATUS=" | cut -d= -f2)
+        PASSED=$(echo "$NODE_OUTPUT" | grep "^PASSED=" | cut -d= -f2)
+        FAILED=$(echo "$NODE_OUTPUT" | grep "^FAILED=" | cut -d= -f2)
+
+        if [ "$STATUS" = "PASS" ]; then
+          echo "  $BOT: $PASSED passed | PASS"
+          TOTAL_PASSED=$((TOTAL_PASSED + PASSED))
+          BOTS_PASS=$((BOTS_PASS + 1))
+        elif [ "$STATUS" = "FAIL" ]; then
+          echo "  $BOT: $PASSED passed, $FAILED FAILED | FAIL"
+          TOTAL_PASSED=$((TOTAL_PASSED + PASSED))
+          TOTAL_FAILED=$((TOTAL_FAILED + FAILED))
+          BOTS_FAIL=$((BOTS_FAIL + 1))
+        else
+          echo "  $BOT: SKIPPED"
+          BOTS_SKIP=$((BOTS_SKIP + 1))
+        fi
+      done
+
+      TOTAL_TESTS=$((TOTAL_PASSED + TOTAL_FAILED))
+      echo ""
+      echo "TOTAL_TESTS=$TOTAL_TESTS"
+      echo "TOTAL_PASSED=$TOTAL_PASSED"
+      echo "TOTAL_FAILED=$TOTAL_FAILED"
+      echo "BOTS_PASS=$BOTS_PASS"
+      echo "BOTS_FAIL=$BOTS_FAIL"
+      echo "BOTS_SKIP=$BOTS_SKIP"
+
+      if [ "$TOTAL_FAILED" -gt 0 ]; then
+        echo "FLEET_STATUS=FAIL"
+      else
+        echo "FLEET_STATUS=PASS"
+      fi
+    depends_on: [test-gulf, test-giovanni, test-boxette, test-automenu, test-atlas, test-sharon]
+    timeout: 15000
+
+  - id: report
+    bash: |
+      echo "=== SENDING TEST REPORT ==="
+
+      TOTAL=$(echo "$summarize.output" | grep "^TOTAL_TESTS=" | cut -d= -f2)
+      PASSED=$(echo "$summarize.output" | grep "^TOTAL_PASSED=" | cut -d= -f2)
+      FAILED=$(echo "$summarize.output" | grep "^TOTAL_FAILED=" | cut -d= -f2)
+      STATUS=$(echo "$summarize.output" | grep "^FLEET_STATUS=" | cut -d= -f2)
+
+      if [ "$STATUS" = "PASS" ]; then
+        EMOJI="✅"
+      else
+        EMOJI="❌"
+      fi
+
+      TEXT="$EMOJI *Bot Fleet Tests*
+
+      Total: $TOTAL | Passed: $PASSED | Failed: $FAILED
+      Status: *$STATUS*
+
+      _Archon aion-bot-tests workflow_"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      echo "Report sent."
+      echo ""
+      echo "$summarize.output"
+    depends_on: [summarize]
+    timeout: 15000

@@ -1,0 +1,185 @@
+name: aion-key-rotation
+description: |
+  Use when: Rotating an Anthropic API key across all services that use it.
+  Triggers: "rotate API key", "key rotation", "new Anthropic key",
+            "refresh API key", "rotate the bot key".
+  NOT for: Telegram token changes (NEVER), Clive/Sage key changes (manual only).
+
+  Safe key rotation pipeline:
+  1. Inventory — which services use the key being rotated
+  2. Pre-rotation verification (current key works, token isolation clean)
+  3. Human approval with full plan
+  4. Update .env files one at a time
+  5. Rolling safe-restarts
+  6. Post-rotation verification + Telegram report
+
+  Input: $1 = which key to rotate: "bot" (general ...bwAA) or description of key
+  Safety: Human approval required. Each step verified. Token isolation checked before AND after.
+
+provider: claude
+model: haiku
+interactive: true
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # INVENTORY: Which services use this key?
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: inventory
+    bash: |
+      echo "=== KEY ROTATION INVENTORY ==="
+      echo "Key to rotate: $1"
+      echo ""
+
+      echo "--- ANTHROPIC KEY USAGE ACROSS .env FILES ---"
+      for DIR in gulf-agent giovanni-bot boxette-bot automenu-bot atlas-bot sharon-bot aios-command-center-aion aion-seo-centre aion-leadgen aion-whatsapp aion-dashboard-api; do
+        ENV_FILE="/root/$DIR/.env"
+        if [ -f "$ENV_FILE" ]; then
+          KEY_LINE=$(grep "ANTHROPIC_API_KEY" "$ENV_FILE" 2>/dev/null | head -1)
+          if [ -n "$KEY_LINE" ]; then
+            # Show only last 8 chars for identification
+            KEY_SUFFIX=$(echo "$KEY_LINE" | grep -oP 'sk-ant-[^\s"]+' | tail -c 9)
+            echo "  $DIR: ...${KEY_SUFFIX}"
+          fi
+        fi
+      done
+      echo ""
+
+      # Check Clive and Sage (separate key, DO NOT TOUCH)
+      echo "--- SACRED KEYS (DO NOT ROTATE HERE) ---"
+      CLIVE_KEY=$(grep -oP 'sk-ant-[^\s"]+' /root/.openclaw/credentials/anthropic-default.json 2>/dev/null | tail -c 9)
+      echo "  Clive: ...${CLIVE_KEY} (systemd — SEPARATE PROCESS)"
+      SAGE_KEY=$(grep "ANTHROPIC_API_KEY" /root/.openclaw/workspace/sage-v3/.env 2>/dev/null | grep -oP 'sk-ant-[^\s"]+' | tail -c 9)
+      echo "  Sage: ...${SAGE_KEY} (SACRED — NEVER TOUCH)"
+      echo ""
+
+      echo "--- TOKEN ISOLATION (pre-rotation) ---"
+      node /root/aion-core/scripts/verify-tokens.js 2>&1
+      echo ""
+
+      echo "--- PM2 ENV AUDIT (pre-rotation) ---"
+      node /root/aion-core/scripts/pm2-env-audit.js 2>&1
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # HUMAN APPROVAL WITH PLAN
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: approval
+    approval:
+      message: |
+        Key rotation inventory complete.
+
+        $inventory.output
+
+        To proceed, you need to:
+        1. Generate a new API key in the Anthropic console
+        2. Paste the new key when prompted
+
+        The workflow will then:
+        - Update each .env file
+        - Safe-restart each affected service
+        - Verify token isolation after each restart
+        - Send a Telegram report
+
+        IMPORTANT: Clive and Sage keys are NEVER touched by this workflow.
+
+        Approve to continue with the rotation.
+      capture_response: true
+    depends_on: [inventory]
+
+  # ═══════════════════════════════════════════════════════════════
+  # EXECUTE ROTATION (AI-guided, cautious)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: rotate
+    prompt: |
+      Key rotation has been approved.
+
+      Inventory: $inventory.output
+      Human response (may contain the new key): $approval.output
+
+      Execute the key rotation following these STRICT rules:
+
+      1. IDENTIFY which .env files need updating based on the inventory
+      2. For EACH .env file:
+         a. Read the current file
+         b. Replace ONLY the ANTHROPIC_API_KEY value
+         c. Write the file back
+         d. Verify the file permissions are still 600
+      3. After ALL .env files are updated:
+         a. Run: node /root/aion-core/scripts/verify-tokens.js
+         b. For each affected PM2 process: bash /root/aion-core/scripts/safe-restart.sh <name>
+         c. Wait 5 seconds between each restart
+         d. After all restarts: node /root/aion-core/scripts/pm2-env-audit.js
+
+      NEVER:
+      - Touch Clive credentials (/root/.openclaw/credentials/)
+      - Touch Sage .env (/root/.openclaw/workspace/sage-v3/.env)
+      - Use pm2 restart --update-env
+      - Touch any Telegram token
+
+      Report exactly what you changed and the verification results.
+    depends_on: [approval]
+    model: sonnet
+
+  # ═══════════════════════════════════════════════════════════════
+  # POST-ROTATION VERIFICATION
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify
+    bash: |
+      echo "=== POST-ROTATION VERIFICATION ==="
+
+      echo "--- Token Isolation ---"
+      node /root/aion-core/scripts/verify-tokens.js 2>&1
+      TOKEN_OK=$?
+
+      echo ""
+      echo "--- PM2 Env Audit ---"
+      node /root/aion-core/scripts/pm2-env-audit.js 2>&1
+      ENV_OK=$?
+
+      echo ""
+      echo "--- PM2 Fleet Status ---"
+      ONLINE=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; data=json.load(sys.stdin); print(sum(1 for p in data if p.get('pm2_env',{}).get('status')=='online'))" 2>/dev/null)
+      TOTAL=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)
+      echo "Fleet: $ONLINE/$TOTAL online"
+
+      echo ""
+      echo "--- .env Permissions ---"
+      PERM_OK=0
+      for DIR in gulf-agent giovanni-bot boxette-bot automenu-bot atlas-bot sharon-bot aios-command-center-aion aion-seo-centre; do
+        ENV_FILE="/root/$DIR/.env"
+        if [ -f "$ENV_FILE" ]; then
+          PERMS=$(stat -c '%a' "$ENV_FILE" 2>/dev/null)
+          if [ "$PERMS" != "600" ]; then
+            echo "  WARN: $ENV_FILE is $PERMS (should be 600)"
+            PERM_OK=1
+          fi
+        fi
+      done
+      if [ "$PERM_OK" -eq 0 ]; then echo "  All .env files are 600"; fi
+
+      # Telegram
+      OVERALL="PASS"
+      if [ "$TOKEN_OK" -ne 0 ] || [ "$ENV_OK" -ne 0 ]; then OVERALL="FAIL"; fi
+
+      TEXT="*Key Rotation Complete*
+
+      Token Check: $([ $TOKEN_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+      Env Audit: $([ $ENV_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+      Fleet: $ONLINE/$TOTAL online
+      Status: *$OVERALL*
+
+      _Archon aion-key-rotation workflow_"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      echo ""
+      echo "KEY_ROTATION=$OVERALL"
+    depends_on: [rotate]
+    timeout: 30000
