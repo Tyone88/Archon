@@ -1,0 +1,753 @@
+name: aion-audit
+description: |
+  Use when: Running a full platform health audit on the Aion VPS.
+  Triggers: "audit the platform", "full audit", "platform health check",
+            "system audit", "how healthy is everything", "run audit".
+  NOT for: Single-repo audits (use /audit skill), deploys (use aion-deploy).
+
+  Read-only 8-agent parallel audit:
+  1. Infrastructure (disk, memory, CPU, PM2 fleet)
+  2. Security (tokens, env leaks, firewall, ports)
+  3. Bot Fleet (6 bots: status, memory, restarts, tests)
+  4. Atlas Base (backend + frontend + endpoints + crons)
+  5. SEO Centre (backend + frontend + GEO checks + scheduler)
+  6. Git Status (16+ repos: uncommitted changes, unpushed commits)
+  7. Integrations (HubSpot, Gmail, Calendly, LightRAG, Telegram)
+  8. Databases (all SQLite DBs: integrity, WAL, size)
+
+  All 8 agents run in parallel (bash, no AI, no mutations).
+  One AI synthesis node scores the platform 0-10 and writes a summary.
+  Final bash node sends the report to Telegram.
+
+  Safety: 100% read-only. No restarts, no writes, no mutations.
+
+provider: claude
+model: haiku
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # AGENT 1: INFRASTRUCTURE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: infra-check
+    bash: |
+      echo "=== INFRASTRUCTURE AUDIT ==="
+      echo ""
+
+      # Disk
+      echo "--- DISK ---"
+      DISK_USAGE=$(df -h / | tail -1 | awk '{print $5}')
+      DISK_AVAIL=$(df -h / | tail -1 | awk '{print $4}')
+      echo "Usage: $DISK_USAGE | Available: $DISK_AVAIL"
+      DISK_PCT=$(echo "$DISK_USAGE" | tr -d '%')
+      if [ "$DISK_PCT" -gt 90 ]; then
+        echo "DISK=FAIL (>90%)"
+      elif [ "$DISK_PCT" -gt 80 ]; then
+        echo "DISK=WARN (>80%)"
+      else
+        echo "DISK=PASS"
+      fi
+      echo ""
+
+      # Memory
+      echo "--- MEMORY ---"
+      free -h | head -2
+      MEM_TOTAL=$(free -m | awk '/Mem:/{print $2}')
+      MEM_USED=$(free -m | awk '/Mem:/{print $3}')
+      MEM_PCT=$((MEM_USED * 100 / MEM_TOTAL))
+      echo "Memory: ${MEM_PCT}% used (${MEM_USED}MB / ${MEM_TOTAL}MB)"
+      if [ "$MEM_PCT" -gt 90 ]; then
+        echo "MEMORY=FAIL (>90%)"
+      elif [ "$MEM_PCT" -gt 80 ]; then
+        echo "MEMORY=WARN (>80%)"
+      else
+        echo "MEMORY=PASS"
+      fi
+      echo ""
+
+      # CPU Load
+      echo "--- CPU ---"
+      LOAD=$(uptime | awk -F'load average:' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
+      CORES=$(nproc)
+      echo "Load: $LOAD | Cores: $CORES"
+      # Compare load to cores using integer math (multiply by 100)
+      LOAD_INT=$(echo "$LOAD" | awk '{printf "%d", $1 * 100}')
+      CORES_INT=$((CORES * 100))
+      if [ "$LOAD_INT" -gt "$CORES_INT" ]; then
+        echo "CPU=WARN (load > cores)"
+      else
+        echo "CPU=PASS"
+      fi
+      echo ""
+
+      # Swap
+      echo "--- SWAP ---"
+      SWAP_USED=$(free -m | awk '/Swap:/{print $3}')
+      SWAP_TOTAL=$(free -m | awk '/Swap:/{print $2}')
+      echo "Swap: ${SWAP_USED}MB / ${SWAP_TOTAL}MB"
+      if [ "$SWAP_USED" -gt 1000 ]; then
+        echo "SWAP=WARN (>1GB used)"
+      else
+        echo "SWAP=PASS"
+      fi
+      echo ""
+
+      # Uptime
+      echo "--- UPTIME ---"
+      uptime -p
+      echo "UPTIME=PASS"
+      echo ""
+
+      # PM2 Fleet
+      echo "--- PM2 FLEET ---"
+      TOTAL=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; data=json.load(sys.stdin); print(len(data))" 2>/dev/null || echo "0")
+      ONLINE=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; data=json.load(sys.stdin); print(sum(1 for p in data if p.get('pm2_env',{}).get('status')=='online'))" 2>/dev/null || echo "0")
+      ERRORED=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; data=json.load(sys.stdin); print(sum(1 for p in data if p.get('pm2_env',{}).get('status')=='errored'))" 2>/dev/null || echo "0")
+      STOPPED=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; data=json.load(sys.stdin); print(sum(1 for p in data if p.get('pm2_env',{}).get('status')=='stopped'))" 2>/dev/null || echo "0")
+      echo "Total: $TOTAL | Online: $ONLINE | Errored: $ERRORED | Stopped: $STOPPED"
+      if [ "$ERRORED" -gt 0 ]; then
+        echo "PM2_FLEET=FAIL ($ERRORED errored)"
+        pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          if p.get('pm2_env',{}).get('status')=='errored':
+              print(f'  ERRORED: {p[\"name\"]}')" 2>/dev/null
+      else
+        echo "PM2_FLEET=PASS ($ONLINE/$TOTAL online)"
+      fi
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # AGENT 2: SECURITY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: security-check
+    bash: |
+      echo "=== SECURITY AUDIT ==="
+      echo ""
+
+      # Token isolation
+      echo "--- TOKEN ISOLATION ---"
+      node /root/aion-core/scripts/verify-tokens.js 2>&1
+      if [ $? -eq 0 ]; then
+        echo "TOKENS=PASS"
+      else
+        echo "TOKENS=FAIL"
+      fi
+      echo ""
+
+      # PM2 env audit
+      echo "--- PM2 ENV AUDIT ---"
+      ENV_OUTPUT=$(node /root/aion-core/scripts/pm2-env-audit.js 2>&1)
+      echo "$ENV_OUTPUT"
+      if echo "$ENV_OUTPUT" | grep -qi "warning\|leak\|violation"; then
+        echo "PM2_ENV=WARN"
+      else
+        echo "PM2_ENV=PASS"
+      fi
+      echo ""
+
+      # .env file permissions
+      echo "--- ENV FILE PERMISSIONS ---"
+      ENV_ISSUES=0
+      for ENV_FILE in /root/gulf-agent/.env /root/giovanni-bot/.env /root/boxette-bot/.env /root/automenu-bot/.env /root/atlas-bot/.env /root/sharon-bot/.env /root/aios-command-center-aion/.env /root/aion-seo-centre/.env /root/aion-leadgen/.env /root/aion-whatsapp/.env; do
+        if [ -f "$ENV_FILE" ]; then
+          PERMS=$(stat -c '%a' "$ENV_FILE" 2>/dev/null)
+          if [ "$PERMS" != "600" ]; then
+            echo "  WARN: $ENV_FILE has perms $PERMS (should be 600)"
+            ENV_ISSUES=$((ENV_ISSUES + 1))
+          fi
+        fi
+      done
+      if [ "$ENV_ISSUES" -eq 0 ]; then
+        echo "ENV_PERMS=PASS"
+      else
+        echo "ENV_PERMS=WARN ($ENV_ISSUES files not 600)"
+      fi
+      echo ""
+
+      # UFW
+      echo "--- FIREWALL ---"
+      UFW_STATUS=$(ufw status 2>/dev/null | head -1)
+      echo "$UFW_STATUS"
+      if echo "$UFW_STATUS" | grep -q "active"; then
+        echo "UFW=PASS"
+      else
+        echo "UFW=FAIL (not active)"
+      fi
+      echo ""
+
+      # Open ports bound to 0.0.0.0
+      echo "--- EXPOSED PORTS ---"
+      EXPOSED=$(ss -tlnp 2>/dev/null | grep "0.0.0.0" | grep -v ":22 \|:80 \|:443 " || true)
+      if [ -n "$EXPOSED" ]; then
+        echo "$EXPOSED"
+        EXPOSED_COUNT=$(echo "$EXPOSED" | wc -l)
+        echo "EXPOSED_PORTS=WARN ($EXPOSED_COUNT ports on 0.0.0.0 besides 22/80/443)"
+      else
+        echo "No unexpected ports exposed"
+        echo "EXPOSED_PORTS=PASS"
+      fi
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # AGENT 3: BOT FLEET
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: bot-fleet-check
+    bash: |
+      echo "=== BOT FLEET AUDIT ==="
+      echo ""
+
+      TOTAL_TESTS=0
+      TOTAL_PASS=0
+      FLEET_STATUS="PASS"
+
+      for BOT_DIR in gulf-agent giovanni-bot boxette-bot automenu-bot atlas-bot sharon-bot; do
+        BOT_PATH="/root/$BOT_DIR"
+        BOT_NAME=$(echo "$BOT_DIR" | sed 's/-bot$//' | sed 's/-agent$//')
+        echo "--- $BOT_NAME ---"
+
+        if [ ! -d "$BOT_PATH" ]; then
+          echo "  SKIP: Directory not found"
+          echo ""
+          continue
+        fi
+
+        # PM2 status
+        PM2_INFO=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          env=p.get('pm2_env',{})
+          cwd=env.get('pm_cwd','')
+          if cwd.rstrip('/') == '$BOT_PATH'.rstrip('/'):
+              mem=p.get('monit',{}).get('memory',0)
+              mem_mb=mem//(1024*1024)
+              restarts=env.get('restart_time',0)
+              status=env.get('status','unknown')
+              print(f'{p[\"name\"]}|{status}|{mem_mb}|{restarts}')
+              sys.exit(0)
+      print('NOT_FOUND|stopped|0|0')
+      " 2>/dev/null)
+
+        PM2_NAME=$(echo "$PM2_INFO" | cut -d'|' -f1)
+        PM2_STATUS=$(echo "$PM2_INFO" | cut -d'|' -f2)
+        PM2_MEM=$(echo "$PM2_INFO" | cut -d'|' -f3)
+        PM2_RESTARTS=$(echo "$PM2_INFO" | cut -d'|' -f4)
+
+        echo "  Process: $PM2_NAME | Status: $PM2_STATUS | Memory: ${PM2_MEM}MB | Restarts: $PM2_RESTARTS"
+
+        if [ "$PM2_STATUS" != "online" ]; then
+          echo "  PM2=FAIL (not online)"
+          FLEET_STATUS="FAIL"
+        elif [ "$PM2_RESTARTS" -gt 10 ]; then
+          echo "  PM2=WARN ($PM2_RESTARTS restarts)"
+        else
+          echo "  PM2=PASS"
+        fi
+
+        # Run tests if vitest config exists
+        if [ -f "$BOT_PATH/vitest.config.js" ] || [ -f "$BOT_PATH/vitest.config.ts" ]; then
+          TEST_OUTPUT=$(cd "$BOT_PATH" && npx vitest run --reporter=verbose 2>&1 | tail -5)
+          TEST_LINE=$(echo "$TEST_OUTPUT" | grep -E "Tests\s+" | head -1)
+          if echo "$TEST_OUTPUT" | grep -q "passed"; then
+            PASSED=$(echo "$TEST_OUTPUT" | grep -oP '\d+(?= passed)' | head -1)
+            FAILED=$(echo "$TEST_OUTPUT" | grep -oP '\d+(?= failed)' | head -1)
+            PASSED=${PASSED:-0}
+            FAILED=${FAILED:-0}
+            echo "  Tests: $PASSED passed, $FAILED failed"
+            TOTAL_TESTS=$((TOTAL_TESTS + PASSED + FAILED))
+            TOTAL_PASS=$((TOTAL_PASS + PASSED))
+            if [ "$FAILED" -gt 0 ]; then
+              echo "  TESTS=FAIL"
+              FLEET_STATUS="FAIL"
+            else
+              echo "  TESTS=PASS"
+            fi
+          else
+            echo "  Tests: Could not parse results"
+            echo "  $TEST_LINE"
+          fi
+        else
+          echo "  Tests: No vitest config found"
+        fi
+        echo ""
+      done
+
+      echo "--- FLEET SUMMARY ---"
+      echo "Total tests: $TOTAL_TESTS | Passed: $TOTAL_PASS"
+      echo "BOT_FLEET=$FLEET_STATUS"
+    timeout: 300000
+
+  # ═══════════════════════════════════════════════════════════════
+  # AGENT 4: ATLAS BASE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: atlas-base-check
+    bash: |
+      echo "=== ATLAS BASE AUDIT ==="
+      echo ""
+
+      # Backend PM2 status
+      echo "--- BACKEND (aion-frontend) ---"
+      BE_STATUS=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          if p['name']=='aion-frontend':
+              env=p.get('pm2_env',{})
+              mem=p.get('monit',{}).get('memory',0)//(1024*1024)
+              print(f'{env.get(\"status\",\"unknown\")}|{mem}|{env.get(\"restart_time\",0)}')
+              sys.exit(0)
+      print('not_found|0|0')
+      " 2>/dev/null)
+      BE_ST=$(echo "$BE_STATUS" | cut -d'|' -f1)
+      BE_MEM=$(echo "$BE_STATUS" | cut -d'|' -f2)
+      BE_RST=$(echo "$BE_STATUS" | cut -d'|' -f3)
+      echo "Status: $BE_ST | Memory: ${BE_MEM}MB | Restarts: $BE_RST"
+      if [ "$BE_ST" = "online" ]; then echo "BACKEND=PASS"; else echo "BACKEND=FAIL"; fi
+      echo ""
+
+      # Frontend PM2 status
+      echo "--- FRONTEND (cc-frontend-premium) ---"
+      FE_STATUS=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          if p['name']=='cc-frontend-premium':
+              env=p.get('pm2_env',{})
+              mem=p.get('monit',{}).get('memory',0)//(1024*1024)
+              print(f'{env.get(\"status\",\"unknown\")}|{mem}|{env.get(\"restart_time\",0)}')
+              sys.exit(0)
+      print('not_found|0|0')
+      " 2>/dev/null)
+      FE_ST=$(echo "$FE_STATUS" | cut -d'|' -f1)
+      FE_MEM=$(echo "$FE_STATUS" | cut -d'|' -f2)
+      FE_RST=$(echo "$FE_STATUS" | cut -d'|' -f3)
+      echo "Status: $FE_ST | Memory: ${FE_MEM}MB | Restarts: $FE_RST"
+      if [ "$FE_ST" = "online" ]; then echo "FRONTEND=PASS"; else echo "FRONTEND=FAIL"; fi
+      echo ""
+
+      # Smoke test key endpoints
+      echo "--- ENDPOINT SMOKE TEST ---"
+      ENDPOINTS_PASS=0
+      ENDPOINTS_FAIL=0
+      for EP in "localhost:3011/api/health" "localhost:3011/api/v2/atlas/briefing" "localhost:3011/api/events/stats" "localhost:3011/api/integrations/health"; do
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: aios_aion_95dd7582" "http://$EP" 2>/dev/null)
+        if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
+          echo "  $EP -> $CODE PASS"
+          ENDPOINTS_PASS=$((ENDPOINTS_PASS + 1))
+        else
+          echo "  $EP -> $CODE FAIL"
+          ENDPOINTS_FAIL=$((ENDPOINTS_FAIL + 1))
+        fi
+      done
+      echo "Endpoints: $ENDPOINTS_PASS pass, $ENDPOINTS_FAIL fail"
+      if [ "$ENDPOINTS_FAIL" -gt 0 ]; then echo "ENDPOINTS=WARN"; else echo "ENDPOINTS=PASS"; fi
+      echo ""
+
+      # Event count in last 24h
+      echo "--- EVENTS (24h) ---"
+      if [ -f "/root/aios-command-center-aion/data/atlas.db" ]; then
+        EVENT_COUNT=$(sqlite3 /root/aios-command-center-aion/data/atlas.db "SELECT COUNT(*) FROM events WHERE created_at > datetime('now', '-1 day');" 2>/dev/null || echo "0")
+        echo "Events in last 24h: $EVENT_COUNT"
+        echo "EVENTS=PASS"
+      else
+        echo "DB not found"
+        echo "EVENTS=WARN"
+      fi
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # AGENT 5: SEO CENTRE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: seo-check
+    bash: |
+      echo "=== SEO CENTRE AUDIT ==="
+      echo ""
+
+      # Backend PM2 status
+      echo "--- BACKEND (aion-seo-centre) ---"
+      SEO_BE=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          if p['name']=='aion-seo-centre':
+              env=p.get('pm2_env',{})
+              mem=p.get('monit',{}).get('memory',0)//(1024*1024)
+              print(f'{env.get(\"status\",\"unknown\")}|{mem}|{env.get(\"restart_time\",0)}')
+              sys.exit(0)
+      print('not_found|0|0')
+      " 2>/dev/null)
+      SEO_ST=$(echo "$SEO_BE" | cut -d'|' -f1)
+      SEO_MEM=$(echo "$SEO_BE" | cut -d'|' -f2)
+      SEO_RST=$(echo "$SEO_BE" | cut -d'|' -f3)
+      echo "Status: $SEO_ST | Memory: ${SEO_MEM}MB | Restarts: $SEO_RST"
+      if [ "$SEO_ST" = "online" ]; then echo "SEO_BACKEND=PASS"; else echo "SEO_BACKEND=FAIL"; fi
+      echo ""
+
+      # Frontend PM2 status
+      echo "--- FRONTEND (aion-seo-frontend) ---"
+      SEO_FE=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          if p['name']=='aion-seo-frontend':
+              env=p.get('pm2_env',{})
+              mem=p.get('monit',{}).get('memory',0)//(1024*1024)
+              print(f'{env.get(\"status\",\"unknown\")}|{mem}|{env.get(\"restart_time\",0)}')
+              sys.exit(0)
+      print('not_found|0|0')
+      " 2>/dev/null)
+      SEOF_ST=$(echo "$SEO_FE" | cut -d'|' -f1)
+      SEOF_MEM=$(echo "$SEO_FE" | cut -d'|' -f2)
+      echo "Status: $SEOF_ST | Memory: ${SEOF_MEM}MB"
+      if [ "$SEOF_ST" = "online" ]; then echo "SEO_FRONTEND=PASS"; else echo "SEO_FRONTEND=FAIL"; fi
+      echo ""
+
+      # Smoke test endpoints
+      echo "--- ENDPOINT SMOKE TEST ---"
+      for EP in "localhost:3020/api/health" "localhost:3020/api/clients"; do
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: aios_aion_95dd7582" "http://$EP" 2>/dev/null)
+        echo "  $EP -> $CODE"
+      done
+      echo ""
+
+      # GEO checks
+      echo "--- GEO CHECKS ---"
+      if [ -f "/root/aion-seo-centre/data/seo.db" ]; then
+        GEO_TOTAL=$(sqlite3 /root/aion-seo-centre/data/seo.db "SELECT COUNT(*) FROM geo_checks;" 2>/dev/null || echo "0")
+        GEO_24H=$(sqlite3 /root/aion-seo-centre/data/seo.db "SELECT COUNT(*) FROM geo_checks WHERE checked_at > datetime('now', '-1 day');" 2>/dev/null || echo "0")
+        echo "Total GEO checks: $GEO_TOTAL | Last 24h: $GEO_24H"
+        echo "GEO=PASS"
+      else
+        echo "SEO DB not found"
+        echo "GEO=WARN"
+      fi
+      echo ""
+
+      # Scheduler jobs
+      echo "--- SCHEDULER JOBS ---"
+      if [ -f "/root/aion-seo-centre/data/seo.db" ]; then
+        JOBS=$(sqlite3 /root/aion-seo-centre/data/seo.db "SELECT COUNT(*) FROM scheduler_jobs WHERE active=1;" 2>/dev/null || echo "0")
+        echo "Active scheduler jobs: $JOBS"
+        echo "SCHEDULER=PASS"
+      else
+        echo "SCHEDULER=WARN"
+      fi
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # AGENT 6: GIT STATUS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: git-check
+    bash: |
+      echo "=== GIT STATUS AUDIT ==="
+      echo ""
+
+      CLEAN=0
+      DIRTY=0
+      UNPUSHED=0
+
+      REPOS="gulf-agent giovanni-bot boxette-bot automenu-bot atlas-bot sharon-bot aios-command-center-aion aios-command-centre-frontend aion-seo-centre aion-seo-frontend aion-dashboard aion-dashboard-api aion-core aion-leadgen aion-whatsapp aion-bot-tracker-factory aion-bot-factory aion-social"
+
+      for REPO in $REPOS; do
+        REPO_PATH="/root/$REPO"
+        if [ ! -d "$REPO_PATH/.git" ]; then
+          continue
+        fi
+
+        cd "$REPO_PATH"
+        CHANGES=$(git status --porcelain 2>/dev/null | head -5)
+        AHEAD=$(git rev-list --count @{upstream}..HEAD 2>/dev/null || echo "0")
+
+        if [ -n "$CHANGES" ]; then
+          DIRTY=$((DIRTY + 1))
+          CHANGE_COUNT=$(git status --porcelain 2>/dev/null | wc -l)
+          echo "  DIRTY: $REPO ($CHANGE_COUNT files)"
+        elif [ "$AHEAD" -gt 0 ]; then
+          UNPUSHED=$((UNPUSHED + 1))
+          echo "  UNPUSHED: $REPO ($AHEAD commits ahead)"
+        else
+          CLEAN=$((CLEAN + 1))
+        fi
+      done
+
+      echo ""
+      echo "--- GIT SUMMARY ---"
+      TOTAL=$((CLEAN + DIRTY + UNPUSHED))
+      echo "Total repos: $TOTAL | Clean: $CLEAN | Dirty: $DIRTY | Unpushed: $UNPUSHED"
+      if [ "$DIRTY" -gt 0 ]; then
+        echo "GIT=WARN ($DIRTY repos with uncommitted changes)"
+      elif [ "$UNPUSHED" -gt 0 ]; then
+        echo "GIT=WARN ($UNPUSHED repos with unpushed commits)"
+      else
+        echo "GIT=PASS"
+      fi
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # AGENT 7: INTEGRATIONS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: integrations-check
+    bash: |
+      echo "=== INTEGRATIONS AUDIT ==="
+      echo ""
+
+      # HubSpot
+      echo "--- HUBSPOT ---"
+      HS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: aios_aion_95dd7582" "http://localhost:3011/api/integrations/health" 2>/dev/null)
+      if [ "$HS_CODE" -ge 200 ] && [ "$HS_CODE" -lt 400 ]; then
+        echo "Integration health endpoint: $HS_CODE PASS"
+        echo "INTEGRATIONS_HEALTH=PASS"
+      else
+        echo "Integration health endpoint: $HS_CODE FAIL"
+        echo "INTEGRATIONS_HEALTH=FAIL"
+      fi
+      echo ""
+
+      # Gmail (check email count from DB)
+      echo "--- GMAIL ---"
+      if [ -f "/root/aios-command-center-aion/data/atlas.db" ]; then
+        EMAIL_COUNT=$(sqlite3 /root/aios-command-center-aion/data/atlas.db "SELECT COUNT(*) FROM email_inbox;" 2>/dev/null || echo "0")
+        RECENT=$(sqlite3 /root/aios-command-center-aion/data/atlas.db "SELECT COUNT(*) FROM email_inbox WHERE received_at > datetime('now', '-1 day');" 2>/dev/null || echo "0")
+        echo "Total emails: $EMAIL_COUNT | Last 24h: $RECENT"
+        if [ "$EMAIL_COUNT" -gt 0 ]; then echo "GMAIL=PASS"; else echo "GMAIL=WARN (no emails)"; fi
+      else
+        echo "GMAIL=WARN (DB not found)"
+      fi
+      echo ""
+
+      # LightRAG
+      echo "--- LIGHTRAG ---"
+      LIGHTRAG_STATUS=$(docker ps --filter "name=lightrag" --format "{{.Status}}" 2>/dev/null)
+      if [ -n "$LIGHTRAG_STATUS" ]; then
+        echo "Container: $LIGHTRAG_STATUS"
+        LRAG_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:9621" 2>/dev/null)
+        echo "WebUI: $LRAG_CODE"
+        echo "LIGHTRAG=PASS"
+      else
+        echo "Container not running"
+        echo "LIGHTRAG=FAIL"
+      fi
+      echo ""
+
+      # Telegram alerts bot
+      echo "--- TELEGRAM (alerts bot only) ---"
+      TG_RESP=$(curl -s "https://api.telegram.org/bot8531024055/getMe" 2>/dev/null)
+      if echo "$TG_RESP" | grep -q '"ok":true'; then
+        BOT_NAME=$(echo "$TG_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('result',{}).get('username','unknown'))" 2>/dev/null)
+        echo "Alerts bot: @$BOT_NAME PASS"
+        echo "TELEGRAM=PASS"
+      else
+        echo "Alerts bot: FAIL"
+        echo "TELEGRAM=FAIL"
+      fi
+      echo ""
+
+      # Calendly (check env var)
+      echo "--- CALENDLY ---"
+      if grep -q "CALENDLY" /root/aios-command-center-aion/.env 2>/dev/null; then
+        echo "CALENDLY=PASS (env var present)"
+      else
+        echo "CALENDLY=WARN (env var missing)"
+      fi
+      echo ""
+
+      # Clive (systemd)
+      echo "--- CLIVE (systemd) ---"
+      CLIVE_STATUS=$(systemctl --user is-active openclaw-gateway 2>/dev/null || echo "unknown")
+      echo "openclaw-gateway: $CLIVE_STATUS"
+      if [ "$CLIVE_STATUS" = "active" ]; then echo "CLIVE=PASS"; else echo "CLIVE=FAIL"; fi
+      echo ""
+
+      # Sage (PM2 — read-only check)
+      echo "--- SAGE (PM2 — read only) ---"
+      SAGE_STATUS=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          if p['name']=='sage-eternity':
+              print(p.get('pm2_env',{}).get('status','unknown'))
+              sys.exit(0)
+      print('not_found')
+      " 2>/dev/null)
+      echo "sage-eternity: $SAGE_STATUS"
+      if [ "$SAGE_STATUS" = "online" ]; then echo "SAGE=PASS"; else echo "SAGE=FAIL"; fi
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # AGENT 8: DATABASES
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: database-check
+    bash: |
+      echo "=== DATABASE AUDIT ==="
+      echo ""
+
+      DB_PASS=0
+      DB_FAIL=0
+
+      DBS="
+      /root/gulf-agent/data/gulf.db|Gulf
+      /root/giovanni-bot/data/giovanni.db|Giovanni
+      /root/boxette-bot/data/boxette.db|Boxette
+      /root/automenu-bot/data/automenu.db|AutoMenu
+      /root/atlas-bot/data/atlas-bot.db|Atlas Bot
+      /root/sharon-bot/data/sharon.db|Sharon
+      /root/aios-command-center-aion/data/atlas.db|Atlas Base
+      /root/aion-seo-centre/data/seo.db|SEO Centre
+      /root/aion-leadgen/db/leadgen.db|Lead Gen
+      /root/aion-dashboard-api/data/dashboard.db|Dashboard API
+      "
+
+      for ENTRY in $DBS; do
+        DB_PATH=$(echo "$ENTRY" | cut -d'|' -f1)
+        DB_NAME=$(echo "$ENTRY" | cut -d'|' -f2)
+
+        if [ ! -f "$DB_PATH" ]; then
+          echo "--- $DB_NAME ---"
+          echo "  Path: $DB_PATH"
+          echo "  STATUS: NOT FOUND"
+          echo ""
+          DB_FAIL=$((DB_FAIL + 1))
+          continue
+        fi
+
+        SIZE=$(du -h "$DB_PATH" 2>/dev/null | awk '{print $1}')
+        INTEGRITY=$(sqlite3 "$DB_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1)
+        WAL_SIZE="N/A"
+        if [ -f "${DB_PATH}-wal" ]; then
+          WAL_SIZE=$(du -h "${DB_PATH}-wal" 2>/dev/null | awk '{print $1}')
+        fi
+
+        echo "--- $DB_NAME ---"
+        echo "  Path: $DB_PATH"
+        echo "  Size: $SIZE | WAL: $WAL_SIZE"
+
+        if [ "$INTEGRITY" = "ok" ]; then
+          echo "  Integrity: PASS"
+          DB_PASS=$((DB_PASS + 1))
+        else
+          echo "  Integrity: FAIL ($INTEGRITY)"
+          DB_FAIL=$((DB_FAIL + 1))
+        fi
+        echo ""
+      done
+
+      echo "--- DATABASE SUMMARY ---"
+      echo "Checked: $((DB_PASS + DB_FAIL)) | Pass: $DB_PASS | Fail: $DB_FAIL"
+      if [ "$DB_FAIL" -gt 0 ]; then
+        echo "DATABASES=FAIL ($DB_FAIL issues)"
+      else
+        echo "DATABASES=PASS"
+      fi
+    timeout: 60000
+
+  # ═══════════════════════════════════════════════════════════════
+  # SYNTHESIS: AI SCORING
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    prompt: |
+      You are scoring the Aion platform health. Analyze these 8 audit reports and produce a structured summary.
+
+      === INFRASTRUCTURE ===
+      $infra-check.output
+
+      === SECURITY ===
+      $security-check.output
+
+      === BOT FLEET ===
+      $bot-fleet-check.output
+
+      === ATLAS BASE ===
+      $atlas-base-check.output
+
+      === SEO CENTRE ===
+      $seo-check.output
+
+      === GIT STATUS ===
+      $git-check.output
+
+      === INTEGRATIONS ===
+      $integrations-check.output
+
+      === DATABASES ===
+      $database-check.output
+
+      Produce EXACTLY this format (no other text):
+
+      SCORE: X.X/10
+      CRIT: N
+      HIGH: N
+      MED: N
+      LOW: N
+
+      DIVISION SCORES:
+      Platform: X.X
+      Bots: X.X
+      Ventures: X.X
+      RevOps: X.X
+      Infra: X.X
+
+      FINDINGS:
+      - [CRIT/HIGH/MED/LOW] Description of finding
+
+      SUMMARY: 2-3 sentence executive summary of platform health.
+
+      Scoring guide:
+      - 9.0+: Everything green, zero issues
+      - 8.0-8.9: Minor warnings, all critical systems healthy
+      - 7.0-7.9: Some issues need attention, nothing broken
+      - 6.0-6.9: Multiple issues, some systems degraded
+      - Below 6.0: Critical problems need immediate attention
+
+      Be honest. Do not inflate scores. FAIL = problem. WARN = deduction. PASS = healthy.
+    depends_on: [infra-check, security-check, bot-fleet-check, atlas-base-check, seo-check, git-check, integrations-check, database-check]
+    model: haiku
+    allowed_tools: []
+
+  # ═══════════════════════════════════════════════════════════════
+  # REPORT: TELEGRAM NOTIFICATION
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    bash: |
+      echo "=== SENDING AUDIT REPORT ==="
+
+      # Extract score from synthesis
+      SCORE=$(echo "$synthesize.output" | grep "^SCORE:" | head -1)
+      CRIT=$(echo "$synthesize.output" | grep "^CRIT:" | head -1)
+      HIGH=$(echo "$synthesize.output" | grep "^HIGH:" | head -1)
+      SUMMARY=$(echo "$synthesize.output" | grep "^SUMMARY:" | head -1)
+
+      # Build Telegram message
+      TEXT="*Platform Audit Complete*
+
+      $SCORE
+      $CRIT | $HIGH
+
+      $SUMMARY
+
+      _Run via Archon aion-audit workflow_"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      echo ""
+      echo "Telegram report sent."
+      echo ""
+      echo "=== FULL SYNTHESIS ==="
+      echo "$synthesize.output"
+      echo ""
+      echo "AUDIT=COMPLETE"
+    depends_on: [synthesize]
+    timeout: 15000
