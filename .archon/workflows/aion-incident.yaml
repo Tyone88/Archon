@@ -1,0 +1,330 @@
+name: aion-incident
+description: |
+  Use when: Something is broken or degraded on the Aion platform.
+  Triggers: "something is broken", "incident response", "diagnose the problem",
+            "why is X down", "fix the outage", "triage this".
+  NOT for: Routine audits (use aion-audit), planned deploys (use aion-deploy).
+
+  Incident response pipeline:
+  1. Parallel triage (4 agents: PM2/logs, endpoints, databases, recent changes)
+  2. AI root cause analysis from all 4 triage reports
+  3. AI proposes fix with specific commands
+  4. Human approval before any mutation
+  5. Execute the approved fix
+  6. Post-fix verification + Telegram report
+
+  Safety: Triage is 100% read-only. Fix requires human approval.
+  Input: $1 = description of the problem (e.g., "gulf bot is down", "Atlas Base 500s")
+
+provider: claude
+model: haiku
+interactive: true
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PARALLEL TRIAGE (4 agents, read-only)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: triage-processes
+    bash: |
+      echo "=== PROCESS TRIAGE ==="
+      echo "Problem reported: $1"
+      echo ""
+
+      # PM2 fleet status
+      echo "--- PM2 STATUS ---"
+      pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          env=p.get('pm2_env',{})
+          status=env.get('status','unknown')
+          restarts=env.get('restart_time',0)
+          mem=p.get('monit',{}).get('memory',0)//(1024*1024)
+          name=p['name']
+          flag=''
+          if status != 'online': flag=' *** NOT ONLINE ***'
+          elif restarts > 10: flag=' *** HIGH RESTARTS ***'
+          print(f'  {name}: {status} | {mem}MB | {restarts} restarts{flag}')
+      " 2>/dev/null
+      echo ""
+
+      # Recent PM2 logs with errors
+      echo "--- RECENT ERRORS (last 50 lines per process) ---"
+      for PROC in aion-frontend cc-frontend-premium aion-seo-centre gulf-agent giovanni-bot boxette-bot automenu-bot atlas-bot sharon-bot; do
+        ERRORS=$(pm2 logs "$PROC" --nostream --lines 50 2>/dev/null | grep -i "error\|ECONNREFUSED\|FATAL\|crash\|uncaught\|unhandled" | tail -5)
+        if [ -n "$ERRORS" ]; then
+          echo "  [$PROC]"
+          echo "$ERRORS" | head -5
+          echo ""
+        fi
+      done
+
+      # Clive (systemd)
+      echo "--- CLIVE (systemd) ---"
+      systemctl --user status openclaw-gateway 2>/dev/null | head -5
+      echo ""
+
+      # System resources
+      echo "--- SYSTEM RESOURCES ---"
+      echo "Disk: $(df -h / | tail -1 | awk '{print $5}') used"
+      echo "Memory: $(free -m | awk '/Mem:/{printf "%d/%dMB (%d%%)", $3, $2, $3*100/$2}')"
+      echo "Load: $(uptime | awk -F'load average:' '{print $2}')"
+    timeout: 30000
+
+  - id: triage-endpoints
+    bash: |
+      echo "=== ENDPOINT TRIAGE ==="
+      echo "Problem reported: $1"
+      echo ""
+
+      ENDPOINTS="
+      localhost:3011/api/health|Atlas Base API
+      localhost:3013|Atlas Base Frontend
+      localhost:3020/api/health|SEO Centre API
+      localhost:3021|SEO Centre Frontend
+      localhost:3050|Dashboard (Gulf)
+      localhost:3040|Dashboard API
+      localhost:9621|LightRAG
+      localhost:18789|Clive
+      "
+
+      echo "--- HTTP HEALTH ---"
+      for ENTRY in $ENDPOINTS; do
+        URL=$(echo "$ENTRY" | cut -d'|' -f1)
+        NAME=$(echo "$ENTRY" | cut -d'|' -f2)
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 "http://$URL" 2>/dev/null)
+        if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
+          echo "  $NAME ($URL): $CODE OK"
+        else
+          echo "  $NAME ($URL): $CODE *** PROBLEM ***"
+        fi
+      done
+      echo ""
+
+      # External endpoints via nginx
+      echo "--- EXTERNAL (nginx) ---"
+      for DOMAIN in cc.aiondevs.io seo.aiondevs.io atlas.aiondevs.io archon.aiondevs.io; do
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "https://$DOMAIN" 2>/dev/null)
+        echo "  $DOMAIN: $CODE"
+      done
+    timeout: 30000
+
+  - id: triage-databases
+    bash: |
+      echo "=== DATABASE TRIAGE ==="
+      echo "Problem reported: $1"
+      echo ""
+
+      DBS="
+      /root/gulf-agent/data/gulf.db|Gulf
+      /root/giovanni-bot/data/giovanni.db|Giovanni
+      /root/boxette-bot/data/boxette.db|Boxette
+      /root/automenu-bot/data/automenu.db|AutoMenu
+      /root/atlas-bot/data/atlas-bot.db|Atlas Bot
+      /root/sharon-bot/data/sharon.db|Sharon
+      /root/aios-command-center-aion/data/atlas.db|Atlas Base
+      /root/aion-seo-centre/data/seo.db|SEO Centre
+      /root/aion-leadgen/db/leadgen.db|Lead Gen
+      /root/aion-dashboard-api/data/dashboard.db|Dashboard API
+      "
+
+      for ENTRY in $DBS; do
+        DB_PATH=$(echo "$ENTRY" | cut -d'|' -f1)
+        DB_NAME=$(echo "$ENTRY" | cut -d'|' -f2)
+        if [ ! -f "$DB_PATH" ]; then
+          echo "  $DB_NAME: *** MISSING ***"
+          continue
+        fi
+        SIZE=$(du -h "$DB_PATH" 2>/dev/null | awk '{print $1}')
+        INTEGRITY=$(sqlite3 "$DB_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1)
+        LOCKED=$(sqlite3 "$DB_PATH" "SELECT 1;" 2>&1 | grep -c "locked")
+        if [ "$INTEGRITY" != "ok" ]; then
+          echo "  $DB_NAME ($SIZE): *** INTEGRITY FAIL: $INTEGRITY ***"
+        elif [ "$LOCKED" -gt 0 ]; then
+          echo "  $DB_NAME ($SIZE): *** LOCKED ***"
+        else
+          echo "  $DB_NAME ($SIZE): OK"
+        fi
+      done
+    timeout: 30000
+
+  - id: triage-changes
+    bash: |
+      echo "=== RECENT CHANGES TRIAGE ==="
+      echo "Problem reported: $1"
+      echo ""
+
+      # Recent git commits across key repos
+      echo "--- LAST COMMIT PER REPO (last 24h) ---"
+      for REPO in gulf-agent giovanni-bot boxette-bot automenu-bot atlas-bot sharon-bot aios-command-center-aion aion-seo-centre aion-dashboard aion-dashboard-api aion-core; do
+        REPO_PATH="/root/$REPO"
+        if [ -d "$REPO_PATH/.git" ]; then
+          LAST=$(cd "$REPO_PATH" && git log --oneline --since="24 hours ago" -1 2>/dev/null)
+          if [ -n "$LAST" ]; then
+            echo "  $REPO: $LAST"
+          fi
+        fi
+      done
+      echo ""
+
+      # Recent PM2 restarts
+      echo "--- PM2 RECENT RESTARTS ---"
+      pm2 jlist 2>/dev/null | python3 -c "
+      import json,sys
+      data=json.load(sys.stdin)
+      for p in data:
+          restarts=p.get('pm2_env',{}).get('restart_time',0)
+          if restarts > 0:
+              print(f'  {p[\"name\"]}: {restarts} restarts')
+      " 2>/dev/null
+      echo ""
+
+      # Recent cron activity
+      echo "--- RECENT CRON (syslog) ---"
+      grep CRON /var/log/syslog 2>/dev/null | tail -5 || echo "  (no syslog access)"
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # AI ROOT CAUSE ANALYSIS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: root-cause
+    prompt: |
+      You are an incident response engineer for the Aion platform (VPS at 89.167.73.122).
+      A problem has been reported: "$1"
+
+      Here are 4 parallel triage reports:
+
+      === PROCESSES & LOGS ===
+      $triage-processes.output
+
+      === ENDPOINTS ===
+      $triage-endpoints.output
+
+      === DATABASES ===
+      $triage-databases.output
+
+      === RECENT CHANGES ===
+      $triage-changes.output
+
+      Analyze all evidence and produce EXACTLY this format:
+
+      ROOT_CAUSE: One sentence describing the most likely root cause.
+
+      EVIDENCE:
+      - Evidence point 1
+      - Evidence point 2
+      - Evidence point 3
+
+      AFFECTED_SERVICES: comma-separated list of affected PM2 process names or services
+
+      FIX_COMMANDS:
+      ```
+      # Exact commands to fix the issue, one per line
+      # Use safe-restart.sh for any PM2 restarts
+      # NEVER use --update-env
+      # NEVER touch sage-eternity
+      ```
+
+      RISK: LOW|MEDIUM|HIGH — how risky is the proposed fix?
+
+      Be specific. Use exact process names and file paths. Do not guess — if evidence is unclear, say so.
+    depends_on: [triage-processes, triage-endpoints, triage-databases, triage-changes]
+    model: sonnet
+    allowed_tools: []
+
+  # ═══════════════════════════════════════════════════════════════
+  # HUMAN APPROVAL
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: approval
+    approval:
+      message: |
+        Incident analysis complete.
+
+        Problem: $1
+
+        $root-cause.output
+
+        Review the root cause analysis and proposed fix commands above.
+        Approve to execute the fix, or reject to stop here.
+      capture_response: true
+    depends_on: [root-cause]
+
+  # ═══════════════════════════════════════════════════════════════
+  # EXECUTE FIX (only after approval)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: execute-fix
+    prompt: |
+      The incident has been approved for fixing.
+
+      Problem: $1
+      Analysis: $root-cause.output
+      Human feedback: $approval.output
+
+      Execute the fix commands from the analysis. Follow these rules:
+      1. NEVER use pm2 restart --update-env
+      2. NEVER touch sage-eternity
+      3. Use bash /root/aion-core/scripts/safe-restart.sh for any PM2 restarts
+      4. Run node /root/aion-core/scripts/verify-tokens.js after any .env changes
+      5. After fixing, verify the service is healthy
+
+      Report exactly what you did and the result.
+    depends_on: [approval]
+    model: sonnet
+
+  # ═══════════════════════════════════════════════════════════════
+  # POST-FIX VERIFICATION + REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify-report
+    bash: |
+      echo "=== POST-FIX VERIFICATION ==="
+
+      # Token check
+      echo "--- Token Isolation ---"
+      node /root/aion-core/scripts/verify-tokens.js 2>&1
+      TOKEN_OK=$?
+
+      # PM2 env audit
+      echo ""
+      echo "--- PM2 Env Audit ---"
+      node /root/aion-core/scripts/pm2-env-audit.js 2>&1
+      ENV_OK=$?
+
+      # Quick endpoint check
+      echo ""
+      echo "--- Quick Health ---"
+      for EP in localhost:3011/api/health localhost:3020/api/health localhost:18789; do
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 "http://$EP" 2>/dev/null)
+        echo "  $EP: $CODE"
+      done
+
+      # PM2 fleet
+      echo ""
+      echo "--- PM2 Fleet ---"
+      ONLINE=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; data=json.load(sys.stdin); print(sum(1 for p in data if p.get('pm2_env',{}).get('status')=='online'))" 2>/dev/null)
+      TOTAL=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)
+      echo "  $ONLINE/$TOTAL online"
+
+      # Telegram report
+      TEXT="*Incident Response Complete*
+
+      Problem: $1
+      Token Check: $([ $TOKEN_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+      Env Audit: $([ $ENV_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+      Fleet: $ONLINE/$TOTAL online
+
+      _Archon aion-incident workflow_"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      echo ""
+      echo "INCIDENT_RESPONSE=COMPLETE"
+    depends_on: [execute-fix]
+    timeout: 30000

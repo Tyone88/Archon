@@ -1,0 +1,216 @@
+name: aion-db-maintenance
+description: |
+  Use when: Running scheduled database maintenance on all SQLite databases.
+  Triggers: "database maintenance", "WAL checkpoint", "backup databases",
+            "DB health check", "checkpoint all databases".
+  NOT for: Full platform audit (use aion-audit), incident response (use aion-incident).
+
+  100% deterministic, zero AI:
+  1. WAL checkpoint on all 10 databases
+  2. Backup each database with timestamp
+  3. Integrity check on all databases
+  4. Report sizes, WAL status, and backup locations
+  5. Telegram summary
+
+  Safety: Read-only except for WAL checkpoints and backup copies.
+  No restarts, no .env changes, no code modifications.
+
+provider: claude
+model: haiku
+
+nodes:
+  - id: checkpoint
+    bash: |
+      echo "=== WAL CHECKPOINT ==="
+      echo ""
+
+      DBS="
+      /root/gulf-agent/data/gulf.db|Gulf
+      /root/giovanni-bot/data/giovanni.db|Giovanni
+      /root/boxette-bot/data/boxette.db|Boxette
+      /root/automenu-bot/data/automenu.db|AutoMenu
+      /root/atlas-bot/data/atlas-bot.db|Atlas Bot
+      /root/sharon-bot/data/sharon.db|Sharon
+      /root/aios-command-center-aion/data/atlas.db|Atlas Base
+      /root/aion-seo-centre/data/seo.db|SEO Centre
+      /root/aion-leadgen/db/leadgen.db|Lead Gen
+      /root/aion-dashboard-api/data/dashboard.db|Dashboard API
+      "
+
+      CHECKPOINT_OK=0
+      CHECKPOINT_FAIL=0
+
+      for ENTRY in $DBS; do
+        DB_PATH=$(echo "$ENTRY" | cut -d'|' -f1)
+        DB_NAME=$(echo "$ENTRY" | cut -d'|' -f2)
+
+        if [ ! -f "$DB_PATH" ]; then
+          echo "  $DB_NAME: SKIP (not found)"
+          continue
+        fi
+
+        WAL_BEFORE="0"
+        if [ -f "${DB_PATH}-wal" ]; then
+          WAL_BEFORE=$(du -b "${DB_PATH}-wal" 2>/dev/null | awk '{print $1}')
+        fi
+
+        RESULT=$(sqlite3 "$DB_PATH" "PRAGMA wal_checkpoint(TRUNCATE);" 2>&1)
+
+        WAL_AFTER="0"
+        if [ -f "${DB_PATH}-wal" ]; then
+          WAL_AFTER=$(du -b "${DB_PATH}-wal" 2>/dev/null | awk '{print $1}')
+        fi
+
+        if echo "$RESULT" | grep -q "^0"; then
+          echo "  $DB_NAME: OK (WAL: ${WAL_BEFORE}→${WAL_AFTER} bytes)"
+          CHECKPOINT_OK=$((CHECKPOINT_OK + 1))
+        else
+          echo "  $DB_NAME: WARN ($RESULT)"
+          CHECKPOINT_FAIL=$((CHECKPOINT_FAIL + 1))
+        fi
+      done
+
+      echo ""
+      echo "CHECKPOINT_OK=$CHECKPOINT_OK"
+      echo "CHECKPOINT_FAIL=$CHECKPOINT_FAIL"
+    timeout: 60000
+
+  - id: backup
+    bash: |
+      echo "=== DATABASE BACKUP ==="
+      echo ""
+
+      TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+      BACKUP_DIR="/root/backups/db-maintenance-$TIMESTAMP"
+      mkdir -p "$BACKUP_DIR"
+
+      DBS="
+      /root/gulf-agent/data/gulf.db|Gulf
+      /root/giovanni-bot/data/giovanni.db|Giovanni
+      /root/boxette-bot/data/boxette.db|Boxette
+      /root/automenu-bot/data/automenu.db|AutoMenu
+      /root/atlas-bot/data/atlas-bot.db|Atlas Bot
+      /root/sharon-bot/data/sharon.db|Sharon
+      /root/aios-command-center-aion/data/atlas.db|Atlas Base
+      /root/aion-seo-centre/data/seo.db|SEO Centre
+      /root/aion-leadgen/db/leadgen.db|Lead Gen
+      /root/aion-dashboard-api/data/dashboard.db|Dashboard API
+      "
+
+      BACKUP_OK=0
+      TOTAL_SIZE=0
+
+      for ENTRY in $DBS; do
+        DB_PATH=$(echo "$ENTRY" | cut -d'|' -f1)
+        DB_NAME=$(echo "$ENTRY" | cut -d'|' -f2)
+
+        if [ ! -f "$DB_PATH" ]; then
+          echo "  $DB_NAME: SKIP (not found)"
+          continue
+        fi
+
+        BACKUP_FILE="$BACKUP_DIR/$(basename $DB_PATH)"
+        sqlite3 "$DB_PATH" ".backup '$BACKUP_FILE'" 2>&1
+        if [ -f "$BACKUP_FILE" ]; then
+          SIZE=$(du -h "$BACKUP_FILE" | awk '{print $1}')
+          SIZE_BYTES=$(du -b "$BACKUP_FILE" | awk '{print $1}')
+          TOTAL_SIZE=$((TOTAL_SIZE + SIZE_BYTES))
+          echo "  $DB_NAME: $SIZE → $BACKUP_FILE"
+          BACKUP_OK=$((BACKUP_OK + 1))
+        else
+          echo "  $DB_NAME: BACKUP FAILED"
+        fi
+      done
+
+      TOTAL_MB=$((TOTAL_SIZE / 1024 / 1024))
+      echo ""
+      echo "BACKUP_DIR=$BACKUP_DIR"
+      echo "BACKUP_OK=$BACKUP_OK"
+      echo "TOTAL_SIZE_MB=$TOTAL_MB"
+    depends_on: [checkpoint]
+    timeout: 120000
+
+  - id: integrity
+    bash: |
+      echo "=== INTEGRITY CHECK ==="
+      echo ""
+
+      DBS="
+      /root/gulf-agent/data/gulf.db|Gulf
+      /root/giovanni-bot/data/giovanni.db|Giovanni
+      /root/boxette-bot/data/boxette.db|Boxette
+      /root/automenu-bot/data/automenu.db|AutoMenu
+      /root/atlas-bot/data/atlas-bot.db|Atlas Bot
+      /root/sharon-bot/data/sharon.db|Sharon
+      /root/aios-command-center-aion/data/atlas.db|Atlas Base
+      /root/aion-seo-centre/data/seo.db|SEO Centre
+      /root/aion-leadgen/db/leadgen.db|Lead Gen
+      /root/aion-dashboard-api/data/dashboard.db|Dashboard API
+      "
+
+      INTEGRITY_OK=0
+      INTEGRITY_FAIL=0
+
+      for ENTRY in $DBS; do
+        DB_PATH=$(echo "$ENTRY" | cut -d'|' -f1)
+        DB_NAME=$(echo "$ENTRY" | cut -d'|' -f2)
+
+        if [ ! -f "$DB_PATH" ]; then
+          continue
+        fi
+
+        SIZE=$(du -h "$DB_PATH" | awk '{print $1}')
+        RESULT=$(sqlite3 "$DB_PATH" "PRAGMA integrity_check;" 2>/dev/null | head -1)
+        TABLES=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';" 2>/dev/null)
+
+        if [ "$RESULT" = "ok" ]; then
+          echo "  $DB_NAME: OK ($SIZE, $TABLES tables)"
+          INTEGRITY_OK=$((INTEGRITY_OK + 1))
+        else
+          echo "  $DB_NAME: *** FAIL *** ($RESULT)"
+          INTEGRITY_FAIL=$((INTEGRITY_FAIL + 1))
+        fi
+      done
+
+      echo ""
+      echo "INTEGRITY_OK=$INTEGRITY_OK"
+      echo "INTEGRITY_FAIL=$INTEGRITY_FAIL"
+    depends_on: [checkpoint]
+    timeout: 60000
+
+  - id: report
+    bash: |
+      echo "=== DB MAINTENANCE REPORT ==="
+
+      CK_OK=$(echo "$checkpoint.output" | grep "^CHECKPOINT_OK=" | cut -d= -f2)
+      CK_FAIL=$(echo "$checkpoint.output" | grep "^CHECKPOINT_FAIL=" | cut -d= -f2)
+      BK_OK=$(echo "$backup.output" | grep "^BACKUP_OK=" | cut -d= -f2)
+      BK_DIR=$(echo "$backup.output" | grep "^BACKUP_DIR=" | cut -d= -f2)
+      BK_SIZE=$(echo "$backup.output" | grep "^TOTAL_SIZE_MB=" | cut -d= -f2)
+      INT_OK=$(echo "$integrity.output" | grep "^INTEGRITY_OK=" | cut -d= -f2)
+      INT_FAIL=$(echo "$integrity.output" | grep "^INTEGRITY_FAIL=" | cut -d= -f2)
+
+      OVERALL="PASS"
+      if [ "${CK_FAIL:-0}" -gt 0 ] || [ "${INT_FAIL:-0}" -gt 0 ]; then
+        OVERALL="FAIL"
+      fi
+
+      TEXT="*DB Maintenance Complete*
+
+      Checkpoints: ${CK_OK:-0} OK, ${CK_FAIL:-0} failed
+      Backups: ${BK_OK:-0} saved (${BK_SIZE:-0}MB)
+      Integrity: ${INT_OK:-0} OK, ${INT_FAIL:-0} failed
+      Location: \`${BK_DIR:-unknown}\`
+      Status: *$OVERALL*
+
+      _Archon aion-db-maintenance workflow_"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      echo ""
+      echo "DB_MAINTENANCE=$OVERALL"
+    depends_on: [backup, integrity]
+    timeout: 15000

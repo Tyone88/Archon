@@ -1,0 +1,223 @@
+name: aion-bot-fix
+description: |
+  Use when: Fixing a bug or adding a feature to an Aion bot.
+  Triggers: "fix gulf bot", "fix the bot", "bot bug", "update boxette",
+            "fix giovanni issue", "bot improvement", "fix <bot-name>".
+  NOT for: Full deploys (use aion-deploy), platform-wide issues (use aion-incident).
+
+  Aion-aware bot fix pipeline — knows our patterns, rules, and infrastructure:
+  1. Investigate the bot codebase and understand the issue
+  2. Run existing tests to establish baseline
+  3. Implement the fix with Aion safety rules enforced
+  4. Run tests again to verify no regressions
+  5. Human approval before commit
+  6. Commit, push, and safe-restart
+
+  Input: $1 = bot directory name (e.g., "gulf-agent", "boxette-bot")
+         $ARGUMENTS = description of the bug or feature
+
+  Safety: Token isolation enforced. safe-restart.sh only. Tests before AND after.
+  Aion rules injected: no --update-env, no cross-project imports, no token sharing.
+
+provider: claude
+model: sonnet
+interactive: true
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # INVESTIGATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    prompt: |
+      You are investigating a bug or feature request for an Aion bot.
+
+      Bot directory: /root/$1
+      Issue: $ARGUMENTS
+
+      AION RULES (MANDATORY):
+      - This bot lives in /root/$1 ONLY. NEVER import from other project directories.
+      - NEVER modify .env files without explicit approval.
+      - NEVER use another bot's Telegram token. Check TOKEN ISOLATION table:
+        Gulf=8777190270, Giovanni=8208222950, Boxette=8692321117,
+        AutoMenu=8695948843, Atlas=8616419169, Sharon=8533038492
+      - The alerts bot token (8531024055) is for internal services ONLY.
+      - All bots use vitest for testing with in-memory SQLite.
+      - SDK modules from /root/aion-core/ are imported via try/catch with stubs.
+
+      INVESTIGATION STEPS:
+      1. Read the bot's CLAUDE.md for architecture context
+      2. Read the main bot.js or index.js entry point
+      3. Identify the relevant code for the reported issue
+      4. Check if there are existing tests covering this area
+      5. Understand the data flow and dependencies
+
+      Output a clear investigation summary:
+      - Root cause (or feature gap)
+      - Files to modify
+      - Approach for the fix
+      - Risks or side effects
+    model: sonnet
+
+  # ═══════════════════════════════════════════════════════════════
+  # BASELINE TESTS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: baseline-tests
+    bash: |
+      echo "=== BASELINE TESTS ==="
+      cd /root/$1
+
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ]; then
+        npx vitest run --reporter=verbose 2>&1 | tail -20
+        PASSED=$(npx vitest run 2>&1 | grep -oP '\d+(?= passed)' | head -1)
+        FAILED=$(npx vitest run 2>&1 | grep -oP '\d+(?= failed)' | head -1)
+        echo ""
+        echo "BASELINE_PASSED=${PASSED:-0}"
+        echo "BASELINE_FAILED=${FAILED:-0}"
+      else
+        echo "No vitest config found — skipping baseline"
+        echo "BASELINE_PASSED=0"
+        echo "BASELINE_FAILED=0"
+      fi
+    depends_on: [investigate]
+    timeout: 120000
+
+  # ═══════════════════════════════════════════════════════════════
+  # IMPLEMENT FIX
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    prompt: |
+      Implement the fix based on the investigation.
+
+      Bot: /root/$1
+      Issue: $ARGUMENTS
+      Investigation: $investigate.output
+      Baseline tests: $baseline-tests.output
+
+      AION SAFETY RULES (ENFORCED):
+      1. ONLY modify files in /root/$1 — NEVER cross project boundaries
+      2. NEVER change Telegram token references
+      3. NEVER modify .env files
+      4. If adding new dependencies, document them but do NOT run npm install
+      5. Write or update tests for any code you change
+      6. Use the existing patterns in the codebase (check CLAUDE.md)
+      7. For API failover: follow the 3-tier pattern (Anthropic → OpenAI → static + queue)
+      8. For DB changes: use the existing db handle patterns with proper error handling
+
+      After implementing:
+      1. Show a summary of all files changed
+      2. Run the tests: cd /root/$1 && npx vitest run
+      3. Report pass/fail count
+    depends_on: [baseline-tests]
+    model: sonnet
+
+  # ═══════════════════════════════════════════════════════════════
+  # VERIFICATION TESTS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify-tests
+    bash: |
+      echo "=== POST-FIX TESTS ==="
+      cd /root/$1
+
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ]; then
+        npx vitest run --reporter=verbose 2>&1 | tail -30
+        PASSED=$(npx vitest run 2>&1 | grep -oP '\d+(?= passed)' | head -1)
+        FAILED=$(npx vitest run 2>&1 | grep -oP '\d+(?= failed)' | head -1)
+        echo ""
+        echo "VERIFY_PASSED=${PASSED:-0}"
+        echo "VERIFY_FAILED=${FAILED:-0}"
+
+        if [ "${FAILED:-0}" -gt 0 ]; then
+          echo "TESTS=FAIL"
+          exit 1
+        else
+          echo "TESTS=PASS"
+        fi
+      else
+        echo "No vitest config — skipping"
+        echo "TESTS=SKIP"
+      fi
+
+      # Token isolation check
+      echo ""
+      echo "--- TOKEN ISOLATION ---"
+      node /root/aion-core/scripts/verify-tokens.js 2>&1
+    depends_on: [implement]
+    timeout: 120000
+
+  # ═══════════════════════════════════════════════════════════════
+  # HUMAN APPROVAL
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: approval
+    approval:
+      message: |
+        Bot fix ready for review.
+
+        Bot: $1
+        Issue: $ARGUMENTS
+
+        Investigation: $investigate.output
+
+        Test results: $verify-tests.output
+
+        Approve to commit, push, and safe-restart the bot.
+        Reject to discard all changes.
+      capture_response: true
+    depends_on: [verify-tests]
+
+  # ═══════════════════════════════════════════════════════════════
+  # COMMIT + PUSH + RESTART
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: ship
+    prompt: |
+      The fix has been approved. Ship it.
+
+      Bot: /root/$1
+      Human feedback: $approval.output
+
+      Steps:
+      1. cd /root/$1
+      2. git add the specific files you changed (NOT git add -A)
+      3. Write a concise commit message (verb + what + why, under 72 chars)
+      4. git commit (include Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>)
+      5. git push
+      6. Run: bash /root/aion-core/scripts/safe-restart.sh <pm2-process-name>
+         (figure out the PM2 name from the ecosystem config or pm2 jlist)
+      7. Wait 5 seconds, then verify the process is online
+      8. Run: node /root/aion-core/scripts/verify-tokens.js
+      9. Run: node /root/aion-core/scripts/pm2-env-audit.js
+
+      NEVER use pm2 restart --update-env.
+      Report the commit hash and final process status.
+    depends_on: [approval]
+    model: sonnet
+
+  - id: report
+    bash: |
+      echo "=== BOT FIX REPORT ==="
+
+      # Verify final state
+      node /root/aion-core/scripts/verify-tokens.js 2>&1
+      TOKEN_OK=$?
+
+      TEXT="*Bot Fix Shipped*
+
+      Bot: \`$1\`
+      Issue: $ARGUMENTS
+      Token Check: $([ $TOKEN_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+
+      _Archon aion-bot-fix workflow_"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      echo "BOT_FIX=COMPLETE"
+    depends_on: [ship]
+    timeout: 15000
