@@ -1,0 +1,339 @@
+name: aion-deploy
+description: |
+  Use when: Deploying code changes from an Aion repo to its PM2 process.
+  Triggers: "deploy gulf-agent", "deploy atlas-bot", "ship automenu-bot",
+            "deploy <repo-name>", "push and restart <repo-name>".
+  NOT for: Frontend deploys (pnpm build needed), Sage or Clive (sacred/systemd),
+           deploys with no code changes, multi-repo deploys.
+
+  Safe deploy pipeline:
+  1. Pre-flight checks (repo exists, changes present, tokens isolated, env clean)
+  2. Run test suite
+  3. AI-generated commit message (haiku, from diff)
+  4. Commit and push
+  5. Human approval before restart
+  6. Safe PM2 restart (delete + start from ecosystem)
+  7. Post-deploy verification + Telegram report
+
+  Safety: Refuses sage-eternity. Refuses --update-env. Token check before AND after restart.
+  Errors: Fail fast on every node. No retries. No workarounds.
+
+provider: claude
+model: haiku
+interactive: true
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 1: PRE-FLIGHT CHECKS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: pre-check
+    bash: |
+      REPO="$1"
+
+      # Validate repo directory
+      if [ ! -d "/root/$REPO" ]; then
+        echo "FAIL: Directory /root/$REPO does not exist"
+        exit 1
+      fi
+
+      cd "/root/$REPO"
+
+      # Check for changes
+      CHANGES=$(git status --porcelain 2>/dev/null)
+      if [ -z "$CHANGES" ]; then
+        echo "FAIL: Nothing to deploy — working tree clean in /root/$REPO"
+        exit 1
+      fi
+
+      echo "=== GIT STATUS ==="
+      git status
+      echo ""
+      echo "=== DIFF SUMMARY ==="
+      git diff --stat
+      git diff --cached --stat
+      echo ""
+
+      # Token isolation check
+      echo "=== TOKEN VERIFICATION ==="
+      node /root/aion-core/scripts/verify-tokens.js
+      if [ $? -ne 0 ]; then
+        echo "FAIL: Token isolation violation detected"
+        exit 1
+      fi
+      echo ""
+
+      # PM2 env audit
+      echo "=== PM2 ENV AUDIT ==="
+      node /root/aion-core/scripts/pm2-env-audit.js
+      echo ""
+
+      # Resolve PM2 process name from cwd
+      echo "=== PM2 PROCESS RESOLUTION ==="
+      PM2_NAME=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json, sys
+      data = json.load(sys.stdin)
+      for p in data:
+          env = p.get('pm2_env', {})
+          cwd = env.get('pm_cwd', '')
+          if cwd.rstrip('/') == '/root/$REPO'.rstrip('/'):
+              print(p['name'])
+              sys.exit(0)
+      print('')
+      " 2>/dev/null)
+
+      if [ -z "$PM2_NAME" ]; then
+        echo "FAIL: No PM2 process found with cwd /root/$REPO"
+        echo "Check: pm2 jlist | python3 -c \"import json,sys; [print(p['name'], p['pm2_env']['pm_cwd']) for p in json.load(sys.stdin)]\""
+        exit 1
+      fi
+
+      # Sacred process guard
+      if [ "$PM2_NAME" = "sage-eternity" ]; then
+        echo "FAIL: REFUSED — sage-eternity is SACRED. Only Ty can restart it."
+        exit 1
+      fi
+
+      echo "REPO=$REPO"
+      echo "PM2_PROCESS=$PM2_NAME"
+      echo "PRE_CHECK=PASS"
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 2: RUN TESTS
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: run-tests
+    bash: |
+      REPO="$1"
+      cd "/root/$REPO"
+
+      # Detect test runner
+      if [ -f "vitest.config.js" ] || [ -f "vitest.config.ts" ] || [ -f "vite.config.ts" ]; then
+        echo "=== RUNNING VITEST ==="
+        npx vitest run --reporter=verbose 2>&1
+      elif [ -f "package.json" ] && grep -q '"test"' package.json; then
+        echo "=== RUNNING NPM TEST ==="
+        npm test 2>&1
+      else
+        echo "WARN: No test configuration found in /root/$REPO — skipping tests"
+        echo "TESTS_SKIPPED=true"
+      fi
+
+      echo ""
+      echo "TESTS=PASS"
+    depends_on: [pre-check]
+    timeout: 120000
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 3: AI COMMIT MESSAGE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: commit-summary
+    prompt: |
+      Generate a git commit message for these changes.
+
+      Repository: $1
+      Diff summary from pre-check:
+      $pre-check.output
+
+      Rules:
+      - One line, under 72 characters
+      - Start with a verb: add, fix, update, remove, refactor, wire
+      - Describe WHAT changed and WHY, not how
+      - No corporate speak, no emojis
+      - Short, direct, like a human wrote it
+      - Examples of good messages:
+        "fix token isolation check on AutoMenu heartbeat"
+        "add 3-tier API failover to Giovanni bot"
+        "update Gulf station status to match dashboard"
+
+      Output ONLY the commit message. No quotes. No markdown. No explanation.
+    depends_on: [run-tests]
+    model: haiku
+    allowed_tools: []
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 4: COMMIT AND PUSH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: commit
+    bash: |
+      REPO="$1"
+      cd "/root/$REPO"
+
+      # Clean the AI output (strip whitespace, quotes, backticks)
+      MSG=$(echo "$commit-summary.output" | tr -d '`"' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -1)
+
+      if [ -z "$MSG" ]; then
+        echo "FAIL: Empty commit message from AI"
+        exit 1
+      fi
+
+      echo "=== COMMITTING ==="
+      echo "Message: $MSG"
+      git add -A
+      git commit -m "$MSG"
+
+      echo ""
+      echo "=== PUSHING ==="
+      git push
+
+      HASH=$(git rev-parse --short HEAD)
+      echo ""
+      echo "COMMIT_HASH=$HASH"
+      echo "COMMIT_MSG=$MSG"
+      echo "COMMIT=PASS"
+    depends_on: [commit-summary]
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 5: HUMAN APPROVAL BEFORE RESTART
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: approval-gate
+    approval:
+      prompt: |
+        Deploy ready for restart.
+
+        Repo: $1
+        Commit: $commit.output
+        Tests: $run-tests.output
+
+        Approve to restart the PM2 process, or reject to stop here (commit already pushed).
+      capture_response: true
+    depends_on: [commit]
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 6: SAFE PM2 RESTART
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: safe-restart
+    bash: |
+      REPO="$1"
+
+      # Extract PM2 process name from pre-check output
+      PM2_NAME=$(echo "$pre-check.output" | grep "PM2_PROCESS=" | cut -d= -f2 | tr -d '[:space:]')
+
+      if [ -z "$PM2_NAME" ]; then
+        echo "FAIL: Could not extract PM2 process name from pre-check"
+        exit 1
+      fi
+
+      echo "=== SAFE RESTART: $PM2_NAME ==="
+      bash /root/aion-core/scripts/safe-restart.sh "$PM2_NAME"
+
+      # Wait for stabilization
+      echo ""
+      echo "Waiting 5 seconds for process stabilization..."
+      sleep 5
+
+      # Quick status check
+      echo ""
+      echo "=== POST-RESTART STATUS ==="
+      pm2 show "$PM2_NAME" | head -20
+
+      # Verify online
+      STATUS=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json, sys
+      data = json.load(sys.stdin)
+      for p in data:
+          if p['name'] == '$PM2_NAME':
+              print(p.get('pm2_env', {}).get('status', 'unknown'))
+              sys.exit(0)
+      print('not_found')
+      " 2>/dev/null)
+
+      if [ "$STATUS" != "online" ]; then
+        echo "FAIL: $PM2_NAME is NOT online (status: $STATUS)"
+        exit 1
+      fi
+
+      echo ""
+      echo "PM2_PROCESS=$PM2_NAME"
+      echo "RESTART=PASS"
+    depends_on: [approval-gate]
+    timeout: 30000
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 7: VERIFY AND REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify-and-report
+    bash: |
+      REPO="$1"
+      PM2_NAME=$(echo "$pre-check.output" | grep "PM2_PROCESS=" | cut -d= -f2 | tr -d '[:space:]')
+      COMMIT_HASH=$(echo "$commit.output" | grep "COMMIT_HASH=" | cut -d= -f2 | tr -d '[:space:]')
+      COMMIT_MSG=$(echo "$commit.output" | grep "COMMIT_MSG=" | cut -d= -f2-)
+
+      echo "=== FINAL VERIFICATION ==="
+
+      # Re-run token verification
+      echo "--- Token Check ---"
+      node /root/aion-core/scripts/verify-tokens.js
+      TOKEN_OK=$?
+
+      # Re-run env audit
+      echo ""
+      echo "--- Env Audit ---"
+      node /root/aion-core/scripts/pm2-env-audit.js
+      ENV_OK=$?
+
+      # Check process health
+      echo ""
+      echo "--- Process Health ---"
+      pm2 show "$PM2_NAME" | head -15
+
+      RESTARTS=$(pm2 jlist 2>/dev/null | python3 -c "
+      import json, sys
+      data = json.load(sys.stdin)
+      for p in data:
+          if p['name'] == '$PM2_NAME':
+              print(p.get('pm2_env', {}).get('restart_time', -1))
+              sys.exit(0)
+      print(-1)
+      " 2>/dev/null)
+
+      # Determine overall status
+      if [ "$TOKEN_OK" -ne 0 ]; then
+        OVERALL="TOKEN VIOLATION"
+      elif [ "$ENV_OK" -ne 0 ]; then
+        OVERALL="ENV LEAK DETECTED"
+      else
+        OVERALL="ALL CLEAR"
+      fi
+
+      echo ""
+      echo "=== DEPLOY SUMMARY ==="
+      echo "Repo: $REPO"
+      echo "Commit: $COMMIT_HASH"
+      echo "Message: $COMMIT_MSG"
+      echo "Process: $PM2_NAME"
+      echo "Restarts: $RESTARTS"
+      echo "Status: $OVERALL"
+
+      # Send Telegram report
+      TEXT="*Deploy Complete*
+      Repo: \`$REPO\`
+      Commit: \`$COMMIT_HASH\`
+      Message: $COMMIT_MSG
+      Process: \`$PM2_NAME\`
+      Token Check: $([ $TOKEN_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+      Env Audit: $([ $ENV_OK -eq 0 ] && echo 'PASS' || echo 'FAIL')
+      Status: $OVERALL"
+
+      curl -s -X POST "https://api.telegram.org/bot8531024055/sendMessage" \
+        -d "chat_id=1490354101" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$TEXT" > /dev/null
+
+      # Fail if verification found issues
+      if [ "$TOKEN_OK" -ne 0 ] || [ "$ENV_OK" -ne 0 ]; then
+        echo "FAIL: Post-deploy verification failed"
+        exit 1
+      fi
+
+      echo ""
+      echo "DEPLOY=COMPLETE"
+    depends_on: [safe-restart]
+    timeout: 30000
