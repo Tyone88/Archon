@@ -335,7 +335,7 @@ nodes:
       ENDPOINTS_PASS=0
       ENDPOINTS_FAIL=0
       for EP in "localhost:3011/api/health" "localhost:3011/api/v2/atlas/briefing" "localhost:3011/api/events/stats" "localhost:3011/api/integrations/health"; do
-        CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: REDACTED_API_KEY" "http://$EP" 2>/dev/null)
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: $ATLAS_API_KEY" "http://$EP" 2>/dev/null)
         if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
           echo "  $EP -> $CODE PASS"
           ENDPOINTS_PASS=$((ENDPOINTS_PASS + 1))
@@ -411,7 +411,7 @@ nodes:
       # Smoke test endpoints
       echo "--- ENDPOINT SMOKE TEST ---"
       for EP in "localhost:3020/api/health" "localhost:3020/api/clients"; do
-        CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: REDACTED_API_KEY" "http://$EP" 2>/dev/null)
+        CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: $ATLAS_API_KEY" "http://$EP" 2>/dev/null)
         echo "  $EP -> $CODE"
       done
       echo ""
@@ -501,7 +501,7 @@ nodes:
 
       # HubSpot
       echo "--- HUBSPOT ---"
-      HS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: REDACTED_API_KEY" "http://localhost:3011/api/integrations/health" 2>/dev/null)
+      HS_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: $ATLAS_API_KEY" "http://localhost:3011/api/integrations/health" 2>/dev/null)
       if [ "$HS_CODE" -ge 200 ] && [ "$HS_CODE" -lt 400 ]; then
         echo "Integration health endpoint: $HS_CODE PASS"
         echo "INTEGRATIONS_HEALTH=PASS"
