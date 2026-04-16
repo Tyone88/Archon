@@ -193,7 +193,7 @@ nodes:
 
   - id: approval-gate
     approval:
-      prompt: |
+      message: |
         Deploy ready for restart.
 
         Repo: $1
