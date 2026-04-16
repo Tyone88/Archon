@@ -10,8 +10,9 @@ description: |
   2. Run existing tests to establish baseline
   3. Implement the fix with Aion safety rules enforced
   4. Run tests again to verify no regressions
-  5. Human approval before commit
-  6. Commit, push, and safe-restart
+  5. Holdout review — fresh context, only sees diff + CLAUDE.md, NOT the investigation
+  6. Human approval before commit
+  7. Commit, push, and safe-restart
 
   Input: $1 = bot directory name (e.g., "gulf-agent", "boxette-bot")
          $ARGUMENTS = description of the bug or feature
@@ -149,6 +150,45 @@ nodes:
     timeout: 120000
 
   # ═══════════════════════════════════════════════════════════════
+  # HOLDOUT REVIEW (fresh context — no knowledge of implementation)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: holdout-review
+    prompt: |
+      HOLDOUT REVIEW — You are a fresh reviewer with NO knowledge of what was implemented or why.
+
+      You must NOT consider:
+      - Implementation plans or investigation notes
+      - Commit messages or PR descriptions
+      - The developer's intent or rationale
+
+      You answer exactly ONE question: Does the code change look correct, safe, and complete?
+
+      Bot directory: /root/$1
+
+      Steps:
+      1. Read the bot's CLAUDE.md for architecture and scope constraints
+      2. Run: cd /root/$1 && git diff HEAD~1 (or git diff if uncommitted)
+      3. Review EVERY changed line for:
+         - Token isolation violations (check the SACRED token table in CLAUDE.md)
+         - Cross-project imports (FORBIDDEN)
+         - .env modifications (FORBIDDEN without approval)
+         - SQL injection or unsafe DB operations
+         - Missing error handling on API calls
+         - Broken test assertions
+         - Scope violations (check "Scope & Protected Boundaries" in CLAUDE.md)
+      4. Check that tests actually cover the changed code paths
+
+      Test results from automated suite: $verify-tests.output
+
+      Output a verdict:
+      - PASS: Code is clean, safe, tests pass, no scope violations
+      - WARN: Minor concerns but acceptable (list them)
+      - FAIL: Blocking issues found (list them — the fix should be rejected)
+    depends_on: [verify-tests]
+    model: sonnet
+
+  # ═══════════════════════════════════════════════════════════════
   # HUMAN APPROVAL
   # ═══════════════════════════════════════════════════════════════
 
@@ -160,14 +200,14 @@ nodes:
         Bot: $1
         Issue: $ARGUMENTS
 
-        Investigation: $investigate.output
+        Holdout review: $holdout-review.output
 
         Test results: $verify-tests.output
 
         Approve to commit, push, and safe-restart the bot.
         Reject to discard all changes.
       capture_response: true
-    depends_on: [verify-tests]
+    depends_on: [holdout-review]
 
   # ═══════════════════════════════════════════════════════════════
   # COMMIT + PUSH + RESTART
