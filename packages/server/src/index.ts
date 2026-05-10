@@ -1053,7 +1053,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       .then(async () => {
         // Stop adapters (these should not throw, but be defensive)
         try {
-          telegram?.stop();
+          // Telegram stop() must be awaited so bot.api.close() lands before exit;
+          // otherwise the server-side getUpdates session lingers ~50s and the next
+          // process launch hits 409 Conflict (Archon silence regression CC26).
+          if (telegram) await telegram.stop();
           discord?.stop();
           // Detach Slack workflow bridge BEFORE stopping the adapter so a
           // pending debounced chat.update can't fire against a closed socket.
