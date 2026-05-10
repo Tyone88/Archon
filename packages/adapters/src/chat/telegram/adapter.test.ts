@@ -235,12 +235,43 @@ describe('TelegramAdapter', () => {
   });
 
   describe('stop()', () => {
-    test('should call bot.stop()', () => {
+    test('returns a Promise that resolves and calls bot.api.close + bot.stop', async () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');
-      const mockStop = mock(() => undefined);
-      (adapter.getBot() as unknown as { stop: typeof mockStop }).stop = mockStop;
-      adapter.stop();
+      const bot = adapter.getBot();
+      const mockClose = mock(() => Promise.resolve(true as const));
+      const mockStop = mock(() => Promise.resolve());
+      (bot.api as unknown as { close: typeof mockClose }).close = mockClose;
+      (bot as unknown as { stop: typeof mockStop }).stop = mockStop;
+
+      const result = adapter.stop();
+      expect(result).toBeInstanceOf(Promise);
+      await expect(result).resolves.toBeUndefined();
+      expect(mockClose).toHaveBeenCalledTimes(1);
       expect(mockStop).toHaveBeenCalledTimes(1);
+    });
+
+    test('swallows close-API errors so shutdown still completes', async () => {
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      const bot = adapter.getBot();
+      const mockClose = mock(() => Promise.reject(new Error('429 Too Many Requests')));
+      const mockStop = mock(() => Promise.resolve());
+      (bot.api as unknown as { close: typeof mockClose }).close = mockClose;
+      (bot as unknown as { stop: typeof mockStop }).stop = mockStop;
+
+      await expect(adapter.stop()).resolves.toBeUndefined();
+      expect(mockClose).toHaveBeenCalledTimes(1);
+      expect(mockStop).toHaveBeenCalledTimes(1);
+    });
+
+    test('swallows bot.stop errors when polling never started', async () => {
+      const adapter = new TelegramAdapter('fake-token-for-testing');
+      const bot = adapter.getBot();
+      const mockClose = mock(() => Promise.resolve(true as const));
+      const mockStop = mock(() => Promise.reject(new Error('Bot is not running')));
+      (bot.api as unknown as { close: typeof mockClose }).close = mockClose;
+      (bot as unknown as { stop: typeof mockStop }).stop = mockStop;
+
+      await expect(adapter.stop()).resolves.toBeUndefined();
     });
   });
 

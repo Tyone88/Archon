@@ -49,6 +49,7 @@
     "test-exclude": "^7.0.1"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.74"
+    "@anthropic-ai/claude-agent-sdk": "^0.2.74",
+    "grammy": "^1.42.0"
   }
 }

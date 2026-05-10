@@ -298,11 +298,30 @@ export class TelegramAdapter implements IPlatformAdapter {
   }
 
   /**
-   * Stop the bot gracefully
+   * Stop the bot gracefully.
+   *
+   * grammY's bot.stop() only signals the local poll loop — Telegram's server
+   * keeps the previous getUpdates session active until its ~50s long-poll
+   * naturally times out. Without an explicit close call, the next process
+   * launch collides with that stale session and gets 409 Conflict.
+   *
+   * The Telegram Bot API `close` method (bot.api.close) releases the session
+   * immediately. Both calls are best-effort: errors are logged but do not
+   * propagate, since the process is shutting down regardless.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     this.stopped = true;
-    this.bot.stop();
+    try {
+      await this.bot.api.close();
+      getLog().info('telegram.session_closed');
+    } catch (err) {
+      getLog().warn({ err }, 'telegram.close_failed_continuing_shutdown');
+    }
+    try {
+      await this.bot.stop();
+    } catch (err) {
+      getLog().debug({ err }, 'telegram.bot_stop_threw_ignored');
+    }
     getLog().info('telegram.bot_stopped');
   }
 

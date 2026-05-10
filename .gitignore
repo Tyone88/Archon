@@ -83,6 +83,13 @@ Thumbs.db
 *.db-wal
 *.db-journal
 
+# Runtime SQLite DB (Archon's local store; should never be committed)
+archon.db
+
+# Operator backups left next to the repo during recovery work
+.env.bak.*
+.archon/workflows/*.bak-*
+
 # Defensive: literal 'undefined' directories from env var bugs
 undefined/
 
