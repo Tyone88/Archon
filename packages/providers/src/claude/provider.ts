@@ -75,11 +75,29 @@ function normalizeClaudeUsage(usage?: {
 }
 
 /**
+ * Keys stripped from the subprocess env to prevent platform-adapter credentials
+ * (Telegram bot token, allowlist, streaming mode, state dir) from leaking into
+ * Claude Code's MCP plugin processes. The Claude Code Telegram plugin reads
+ * `TELEGRAM_BOT_TOKEN` from its own process env and starts a competing grammY
+ * Bot on that token if present — when archon-web spawns the SDK, the plugin
+ * inherits archon's TELEGRAM_BOT_TOKEN and produces a permanent 409 conflict
+ * on the same bot. See CC27 (2026-05-10) incident; tracked in #1135.
+ *
+ * Anything matching /^TELEGRAM_/ is stripped. Add Slack/Discord prefixes if
+ * those plugins exhibit the same leak pattern.
+ */
+const SUBPROCESS_ENV_STRIP_PREFIXES = ['TELEGRAM_'] as const;
+
+/**
  * Build environment for Claude subprocess.
  *
  * process.env is already clean at this point:
  * - stripCwdEnv() at entry point removed CWD .env keys + CLAUDECODE markers
  * - ~/.archon/.env loaded with override:true as the trusted source
+ *
+ * Additionally strips platform-adapter credentials so they don't leak into
+ * MCP plugin processes. The architectural fix lives at the caller side
+ * (#1135); this is the pragmatic chokepoint while that work is pending.
  */
 function buildSubprocessEnv(): NodeJS.ProcessEnv {
   const hasExplicitTokens = Boolean(
@@ -90,8 +108,25 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
     { authMode },
     authMode === 'global' ? 'using_global_auth' : 'using_explicit_tokens'
   );
-  return { ...process.env };
+
+  const stripped: string[] = [];
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (SUBPROCESS_ENV_STRIP_PREFIXES.some(p => k.startsWith(p))) {
+      stripped.push(k);
+      continue;
+    }
+    env[k] = v;
+  }
+  if (stripped.length > 0) {
+    getLog().debug({ strippedKeys: stripped }, 'claude.subprocess_env_platform_creds_stripped');
+  }
+  return env;
 }
+
+// Test-only export so the env-leak gate can be regression-tested without
+// reaching into module internals. Not part of the public API.
+export const buildSubprocessEnvForTest = buildSubprocessEnv;
 
 /** Max retries for transient subprocess failures */
 const MAX_SUBPROCESS_RETRIES = 3;
@@ -867,10 +902,11 @@ export class ClaudeProvider implements IAgentProvider {
    * Send a query to Claude and stream responses.
    * Orchestrates option building, nodeConfig translation, streaming, and retry.
    */
-  // TODO(#1135): Pre-spawn env-leak gate was removed during provider extraction.
-  // Caller-side enforcement (orchestrator, dag-executor) is tracked in #1135.
-  // Providers must NOT implement security gates — the platform guarantees safety
-  // before a provider runs.
+  // CC27 (2026-05-10): Pragmatic env-leak gate restored in buildSubprocessEnv()
+  // for the TELEGRAM_ prefix after a permanent 409 cascade caused by the Claude
+  // Code Telegram plugin inheriting archon-web's TELEGRAM_BOT_TOKEN through the
+  // SDK subprocess. Architectural caller-side enforcement still tracked in #1135;
+  // remove the provider-side gate once that lands.
   async *sendQuery(
     prompt: string,
     cwd: string,

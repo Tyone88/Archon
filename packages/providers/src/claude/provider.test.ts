@@ -16,7 +16,7 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockQuery,
 }));
 
-import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
+import { ClaudeProvider, shouldPassNoEnvFile, buildSubprocessEnvForTest } from './provider';
 import * as claudeModule from './provider';
 
 describe('shouldPassNoEnvFile', () => {
@@ -1164,5 +1164,88 @@ describe('sendQuery decomposition behaviors', () => {
       expect.objectContaining({ sessionId: 'sid-err', errorSubtype: 'max_turns' }),
       'claude.result_is_error'
     );
+  });
+});
+
+// CC27 (2026-05-10) — regression guard for the platform-adapter env-leak gate.
+// The Claude Code Telegram MCP plugin reads TELEGRAM_BOT_TOKEN from its own
+// process env. When archon-web spawns the Claude Agent SDK, the plugin would
+// inherit archon's TELEGRAM_BOT_TOKEN and start a competing grammY Bot on the
+// same token, producing permanent 409 conflict. The gate in buildSubprocessEnv()
+// strips TELEGRAM_* keys before they reach the spawned SDK subprocess.
+describe('buildSubprocessEnv — platform credential leak gate (CC27)', () => {
+  const TELEGRAM_KEYS = [
+    'TELEGRAM_BOT_TOKEN',
+    'TELEGRAM_ALLOWED_USER_IDS',
+    'TELEGRAM_STREAMING_MODE',
+    'TELEGRAM_STATE_DIR',
+  ] as const;
+  const KEEP_KEYS = [
+    'CLAUDE_API_KEY',
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'PATH',
+  ] as const;
+  const originals: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const k of [...TELEGRAM_KEYS, ...KEEP_KEYS]) originals[k] = process.env[k];
+  });
+
+  // Restore after each — Bun's mock.restore() doesn't undo env mutations.
+  function restoreEnv(): void {
+    for (const [k, v] of Object.entries(originals)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+
+  test('strips every TELEGRAM_* key from the returned env', () => {
+    for (const k of TELEGRAM_KEYS) process.env[k] = 'leaked-secret';
+    try {
+      const env = buildSubprocessEnvForTest();
+      for (const k of TELEGRAM_KEYS) {
+        expect(env[k]).toBeUndefined();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('preserves Claude/Anthropic auth keys and PATH', () => {
+    process.env.CLAUDE_API_KEY = 'sk-ant-test';
+    process.env.PATH = '/usr/bin:/bin';
+    try {
+      const env = buildSubprocessEnvForTest();
+      expect(env.CLAUDE_API_KEY).toBe('sk-ant-test');
+      expect(env.PATH).toBe('/usr/bin:/bin');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('strips even when only one TELEGRAM_* key is present', () => {
+    delete process.env.TELEGRAM_ALLOWED_USER_IDS;
+    delete process.env.TELEGRAM_STREAMING_MODE;
+    delete process.env.TELEGRAM_STATE_DIR;
+    process.env.TELEGRAM_BOT_TOKEN = '8790120379:fake_token_for_testing';
+    try {
+      const env = buildSubprocessEnvForTest();
+      expect(env.TELEGRAM_BOT_TOKEN).toBeUndefined();
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('does NOT strip keys that merely contain "TELEGRAM" but do not start with it', () => {
+    // Defensive — the gate is prefix-based. A var like MY_TELEGRAM_LOG must pass.
+    process.env.MY_TELEGRAM_LOG = 'app-log';
+    try {
+      const env = buildSubprocessEnvForTest();
+      expect(env.MY_TELEGRAM_LOG).toBe('app-log');
+    } finally {
+      delete process.env.MY_TELEGRAM_LOG;
+      restoreEnv();
+    }
   });
 });
