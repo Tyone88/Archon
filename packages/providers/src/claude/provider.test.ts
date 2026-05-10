@@ -24,7 +24,12 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockQuery,
 }));
 
-import { ClaudeProvider, classifySubprocessError, shouldPassNoEnvFile } from './provider';
+import {
+  ClaudeProvider,
+  classifySubprocessError,
+  shouldPassNoEnvFile,
+  buildSubprocessEnvForTest,
+} from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
 

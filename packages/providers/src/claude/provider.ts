@@ -169,6 +169,20 @@ function selectResolvedModelId(
 }
 
 /**
+ * Keys stripped from the subprocess env to prevent platform-adapter credentials
+ * (Telegram bot token, allowlist, streaming mode, state dir) from leaking into
+ * Claude Code's MCP plugin processes. The Claude Code Telegram plugin reads
+ * `TELEGRAM_BOT_TOKEN` from its own process env and starts a competing grammY
+ * Bot on that token if present — when archon-web spawns the SDK, the plugin
+ * inherits archon's TELEGRAM_BOT_TOKEN and produces a permanent 409 conflict
+ * on the same bot. See CC27 (2026-05-10) incident; tracked in #1135.
+ *
+ * Anything matching /^TELEGRAM_/ is stripped. Add Slack/Discord prefixes if
+ * those plugins exhibit the same leak pattern.
+ */
+const SUBPROCESS_ENV_STRIP_PREFIXES = ['TELEGRAM_'] as const;
+
+/**
  * Build environment for Claude subprocess.
  *
  * process.env is already clean at this point:
@@ -185,8 +199,27 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
     { authMode },
     authMode === 'global' ? 'using_global_auth' : 'using_explicit_tokens'
   );
-  return { ...process.env };
+
+  // CC27 (2026-05-10): strip platform-adapter credentials so they don't leak
+  // into MCP plugin processes. Architectural caller-side fix tracked in #1135.
+  const stripped: string[] = [];
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (SUBPROCESS_ENV_STRIP_PREFIXES.some(p => k.startsWith(p))) {
+      stripped.push(k);
+      continue;
+    }
+    env[k] = v;
+  }
+  if (stripped.length > 0) {
+    getLog().debug({ strippedKeys: stripped }, 'claude.subprocess_env_platform_creds_stripped');
+  }
+  return env;
 }
+
+// Test-only export so the env-leak gate can be regression-tested without
+// reaching into module internals. Not part of the public API.
+export const buildSubprocessEnvForTest = buildSubprocessEnv;
 
 /**
  * Build the base env for a CONTAINER run. Deliberately does NOT spread
