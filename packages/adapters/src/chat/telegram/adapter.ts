@@ -42,6 +42,9 @@ export class TelegramAdapter implements IPlatformAdapter {
     }
 
     getLog().info({ mode }, 'telegram.adapter_initialized');
+
+    // Register handlers once during initialization (not in start() to avoid duplication on retries)
+    this.registerHandlers();
   }
 
   /**
@@ -168,11 +171,31 @@ export class TelegramAdapter implements IPlatformAdapter {
   private restartDelayMs = 60_000;
 
   /**
-   * Start the bot (begins polling).
-   * Makes up to 3 attempts on 409 Conflict (stale getUpdates connection).
+   * Register handlers once during initialization.
+   * Must be called before start() to avoid duplicate listener errors.
    */
-  async start(options?: { retryDelayMs?: number }): Promise<void> {
-    // Register message handler before launch
+  private registerHandlers(): void {
+    // Register error handler to catch mid-polling 409s and auto-recover
+    this.bot.catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      getLog().error({ err }, 'telegram.polling_error');
+
+      if (message.includes('409')) {
+        getLog().warn('telegram.409_during_polling_attempting_recovery');
+        // Release session and re-launch after delay
+        this.bot.api.deleteWebhook({ drop_pending_updates: true }).catch(() => {
+          /* ignore */
+        });
+        setTimeout(() => {
+          if (this.stopped) return;
+          this.start({ retryDelayMs: this.restartDelayMs }).catch((launchErr: unknown) => {
+            getLog().error({ err: launchErr }, 'telegram.recovery_launch_failed');
+          });
+        }, 65_000); // Wait longer than the 50s long-poll timeout
+      }
+    });
+
+    // Register message handler
     this.bot.on('message:text', ctx => {
       const message = ctx.message.text;
       if (!message) return;
@@ -197,7 +220,13 @@ export class TelegramAdapter implements IPlatformAdapter {
         getLog().debug({ chatId: ctx.chat?.id }, 'telegram.message_dropped_no_handler');
       }
     });
+  }
 
+  /**
+   * Start the bot (begins polling).
+   * Makes up to 3 attempts on 409 Conflict (stale getUpdates connection).
+   */
+  async start(options?: { retryDelayMs?: number }): Promise<void> {
     // Retry on 409 Conflict — another getUpdates is still active (Telegram's long-poll timeout is 50s).
     // Wait 60s between attempts to outlast the stale connection. Do NOT recreate the bot instance
     // on each retry — that adds more stale connections rather than fewer.
@@ -216,15 +245,15 @@ export class TelegramAdapter implements IPlatformAdapter {
           getLog().warn({ err: e }, 'telegram.delete_webhook_failed');
         }
 
-        // drop_pending_updates: true — discard queued messages from while the bot was offline
-        // to avoid reprocessing stale commands after a container restart.
+        // drop_pending_updates: false — preserve queued messages so they survive restarts.
+        // The offset tracking in grammY handles deduplication automatically.
         // grammY's start() resolves only when the bot stops; use onStart callback to detect
         // successful launch and return immediately while the bot continues running in background.
         await new Promise<void>((resolve, reject) => {
           let started = false;
           this.bot
             .start({
-              drop_pending_updates: true,
+              drop_pending_updates: false,
               onStart: () => {
                 started = true;
                 resolve();
@@ -254,6 +283,12 @@ export class TelegramAdapter implements IPlatformAdapter {
             { err, attempt, maxAttempts: MAX_ATTEMPTS, retryDelayMs: RETRY_DELAY_MS },
             'telegram.start_conflict_retrying'
           );
+          // Release the server-side session before retrying
+          try {
+            await this.bot.api.deleteWebhook({ drop_pending_updates: false });
+          } catch {
+            /* ignore — best effort */
+          }
           await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
         } else {
           throw err instanceof Error ? err : new Error(message);
