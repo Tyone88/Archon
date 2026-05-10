@@ -162,6 +162,11 @@ export class TelegramAdapter implements IPlatformAdapter {
     this.messageHandler = handler;
   }
 
+  /** Whether the adapter has been intentionally stopped (suppresses auto-restart). */
+  private stopped = false;
+  /** Default delay between 409 restart attempts. */
+  private restartDelayMs = 60_000;
+
   /**
    * Start the bot (begins polling).
    * Makes up to 3 attempts on 409 Conflict (stale getUpdates connection).
@@ -198,26 +203,45 @@ export class TelegramAdapter implements IPlatformAdapter {
     // on each retry — that adds more stale connections rather than fewer.
     const MAX_ATTEMPTS = 3;
     const RETRY_DELAY_MS = options?.retryDelayMs ?? 60_000;
+    this.restartDelayMs = RETRY_DELAY_MS;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
+        // Clear any lingering webhook AND any other active getUpdates session.
+        // Telegram only allows one consumer of updates per bot token; if a previous
+        // process (or another deployment) is still long-polling, we'll get 409s
+        // forever. deleteWebhook with drop_pending_updates=true forcibly bumps it.
+        try {
+          await this.bot.api.deleteWebhook({ drop_pending_updates: true });
+        } catch (e) {
+          getLog().warn({ err: e }, 'telegram.delete_webhook_failed');
+        }
+
         // drop_pending_updates: true — discard queued messages from while the bot was offline
         // to avoid reprocessing stale commands after a container restart.
         // grammY's start() resolves only when the bot stops; use onStart callback to detect
         // successful launch and return immediately while the bot continues running in background.
         await new Promise<void>((resolve, reject) => {
+          let started = false;
           this.bot
             .start({
               drop_pending_updates: true,
               onStart: () => {
+                started = true;
                 resolve();
               },
             })
             .catch((err: unknown) => {
               const error = err instanceof Error ? err : new Error(String(err));
-              // Log post-startup crashes — after onStart fires the reject() below is a no-op
-              // (Promise already settled), but the error should still be observable in logs.
+              if (!started) {
+                reject(error);
+                return;
+              }
+              // Post-startup crash. The most common cause is a 409 from another
+              // getUpdates consumer that appeared after we started polling. The
+              // outer reject is a no-op here (promise already settled), so we
+              // schedule an auto-restart instead of dying silently.
               getLog().error({ err: error }, 'telegram.bot_runtime_error');
-              reject(error);
+              this.scheduleRestart();
             });
         });
         getLog().info('telegram.bot_started');
@@ -242,7 +266,26 @@ export class TelegramAdapter implements IPlatformAdapter {
    * Stop the bot gracefully
    */
   stop(): void {
+    this.stopped = true;
     this.bot.stop();
     getLog().info('telegram.bot_stopped');
+  }
+
+  /**
+   * Restart polling after a runtime crash (typically a 409 from another
+   * getUpdates consumer). Waits for the conflicting connection to time out
+   * (Telegram long-poll is ~50s), then resumes. Does nothing if stopped.
+   */
+  private scheduleRestart(): void {
+    if (this.stopped) return;
+    const delay = this.restartDelayMs;
+    getLog().warn({ delayMs: delay }, 'telegram.restart_scheduled');
+    setTimeout(() => {
+      if (this.stopped) return;
+      this.start({ retryDelayMs: this.restartDelayMs }).catch((err: unknown) => {
+        getLog().error({ err }, 'telegram.restart_failed');
+        this.scheduleRestart();
+      });
+    }, delay);
   }
 }
