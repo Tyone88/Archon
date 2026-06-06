@@ -1032,7 +1032,7 @@ describe('CommandHandler', () => {
         expect(result.message).toContain('and 5 more');
       });
 
-      test('should pass loadConfig as second argument to discoverWorkflowsWithConfig', async () => {
+      test('should pass loadConfig + globalSearchPath to discoverWorkflowsWithConfig', async () => {
         spyDiscoverWorkflows.mockResolvedValueOnce({
           workflows: [makeTestWorkflowWithSource({ name: 'test-wf', description: 'Test' })],
           errors: [],
@@ -1040,8 +1040,13 @@ describe('CommandHandler', () => {
 
         await handleCommand(conversationWithCodebase, '/workflow list');
 
-        // Verify loadConfig function is passed as the second argument
-        expect(spyDiscoverWorkflows).toHaveBeenCalledWith(expect.any(String), expect.any(Function));
+        // loadConfig is the second arg; the third opts arg carries globalSearchPath so
+        // user-global (~/.archon/.archon/workflows) workflows are discovered (the aion-* ops set).
+        expect(spyDiscoverWorkflows).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.any(Function),
+          expect.objectContaining({ globalSearchPath: expect.any(String) })
+        );
       });
     });
 
