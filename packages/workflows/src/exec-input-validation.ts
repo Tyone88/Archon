@@ -73,6 +73,18 @@ export function inlineExecInputSource(
   return { text: target.slot.value, label: 'script', runtime: target.node.runtime };
 }
 
+/**
+ * Operator switches the bundled sdlc pack documents as read from the HOST
+ * environment (a host run spreads `process.env` into script nodes; a container
+ * run deliberately receives neither). The static scan cannot see the operator's
+ * shell, so without this list every install warns on `archon workflow list`
+ * for a variable the engine does deliver. CC30 (aion-custom, 2026-10-07).
+ */
+const HOST_OPERATOR_ENVIRONMENT_NAMES: readonly string[] = [
+  'ARCHON_SDLC_FORGE',
+  'ARCHON_CLI_COMMAND',
+];
+
 export function validateExecInputTargets(
   workflow: Pick<WorkflowDefinition, 'inputs'>,
   targets: readonly ExecInputValidationTarget[],
@@ -88,6 +100,7 @@ export function validateExecInputTargets(
 
     const availableNames = [...new Set([...target.bindingNames, ...declaredInputs])].sort();
     const availableEnv = new Set(EXEC_NODE_ENVIRONMENT_NAMES);
+    for (const name of HOST_OPERATOR_ENVIRONMENT_NAMES) availableEnv.add(name);
     for (const name of availableNames) availableEnv.add(inputEnvKey(name));
 
     for (const read of scanEnvironmentReads(source.text, source.runtime)) {

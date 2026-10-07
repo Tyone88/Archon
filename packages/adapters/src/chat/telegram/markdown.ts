@@ -42,6 +42,13 @@ export function convertToTelegramMarkdown(markdown: string): string {
     // MarkdownV2 requires single asterisk *bold* not double **bold**
     result = fixRemainingDoubleBold(result);
 
+    // Post-processing: collapse double escapes the library emits inside table
+    // cells (it escapes the cell text, then escapes the unsupported row again).
+    // In MarkdownV2 `\\(` is an escaped backslash followed by a BARE `(`, which
+    // Telegram rejects with "Character '(' is reserved" — the whole message then
+    // falls back to plain text. CC30 (2026-10-07).
+    result = fixDoubleEscapes(result);
+
     return result;
   } catch (error) {
     getLog().warn({ err: error }, 'telegram.markdown_conversion_failed');
@@ -60,6 +67,20 @@ function fixRemainingDoubleBold(text: string): string {
   // Match **text** but not already escaped \*\*
   // Replace with single asterisk *text*
   return text.replace(/(?<!\\)\*\*([^*]+)\*\*/g, '*$1*');
+}
+
+/**
+ * Collapse `\\X` (escaped backslash + bare reserved char) to `\X` (escaped char)
+ * for every MarkdownV2 reserved character. Only exactly-two-backslash runs are
+ * touched, so a genuinely escaped backslash followed by an escaped char (`\\\X`)
+ * is left alone. GFM treats `\(` as a literal `(` anyway, so the rendered text
+ * is the same either way — but Telegram now parses it.
+ *
+ * @param text - Converted MarkdownV2 text
+ * @returns Text with double escapes collapsed
+ */
+export function fixDoubleEscapes(text: string): string {
+  return text.replace(/(?<!\\)\\\\([_*[\]()~`>#+\-=|{}.!])/g, '\\$1');
 }
 
 /**

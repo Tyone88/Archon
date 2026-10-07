@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 
-import { convertToTelegramMarkdown, escapeMarkdownV2, isAlreadyEscaped } from './markdown';
+import {
+  convertToTelegramMarkdown,
+  escapeMarkdownV2,
+  fixDoubleEscapes,
+  isAlreadyEscaped,
+} from './markdown';
 
 describe('telegram-markdown', () => {
   describe('convertToTelegramMarkdown', () => {
@@ -66,6 +71,58 @@ describe('telegram-markdown', () => {
         const result = convertToTelegramMarkdown(input);
         // Should have escaped . + -
         expect(result).toBeDefined();
+      });
+    });
+
+    describe('tables with reserved characters (CC30 regression, 2026-10-07)', () => {
+      // Every reserved char outside a code span must be preceded by an ODD number
+      // of backslashes; `\\\\(` (even) is an escaped backslash + a bare `(`, which
+      // Telegram rejects with "Character '(' is reserved and must be escaped".
+      function bareReserved(text: string): string[] {
+        const noCode = text
+          .replace(/```[\s\S]*?```/g, m => ' '.repeat(m.length))
+          .replace(/`[^`\n]*`/g, m => ' '.repeat(m.length));
+        const hits: string[] = [];
+        const re = /[_*[\]()~`>#+\-=|{}.!]/g;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(noCode)) !== null) {
+          let backslashes = 0;
+          for (let i = m.index - 1; i >= 0 && noCode[i] === '\\'; i--) backslashes++;
+          if (backslashes % 2 === 0)
+            hits.push(noCode.slice(Math.max(0, m.index - 12), m.index + 1));
+        }
+        return hits;
+      }
+
+      const table = [
+        '| Item | Status |',
+        '|------|--------|',
+        '| Subscription | **Done** — `/root/archon` runs on your Max login (`CLAUDE_USE_GLOBAL_AUTH=true`), no API key |',
+        '| Version | **Done** — v0.11.1 live (was v0.3.6), `3e38883c`, tag `stable-archon-cc29-locked` |',
+        '| Haiku nodes | **Done** — fixed, answers at 26k tokens (was "Prompt is too long") |',
+      ].join('\n');
+
+      test('table cells with parentheses, dots and backticks have no bare reserved chars', () => {
+        const result = convertToTelegramMarkdown(table);
+        expect(result).not.toContain('\\\\(');
+        expect(result).not.toContain('\\\\.');
+        expect(bareReserved(result)).toEqual([]);
+      });
+
+      test('brackets, backticks and parentheses in bullets stay parseable', () => {
+        const input =
+          '- Cleanup `*.pre-cc29` files (`node_modules.pre-cc29`, `dist.pre-cc29`)\n' +
+          '- Decision on the [7 April commits] in `aion-custom-v0.3.6-backup` (never ported)';
+        const result = convertToTelegramMarkdown(input);
+        expect(bareReserved(result)).toEqual([]);
+      });
+
+      test('fixDoubleEscapes collapses only exactly-two-backslash runs', () => {
+        expect(fixDoubleEscapes('a \\\\( b')).toBe('a \\( b');
+        expect(fixDoubleEscapes('v0\\\\.11\\\\.1')).toBe('v0\\.11\\.1');
+        expect(fixDoubleEscapes('ok \\( already')).toBe('ok \\( already');
+        expect(fixDoubleEscapes('tri \\\\\\( ple')).toBe('tri \\\\\\( ple');
+        expect(fixDoubleEscapes('no reserved \\\\x')).toBe('no reserved \\\\x');
       });
     });
 

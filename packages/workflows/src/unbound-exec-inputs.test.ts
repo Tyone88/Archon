@@ -101,6 +101,28 @@ nodes:
     expect(result.warnings).toEqual([]);
   });
 
+  test('accepts the documented host operator switches read by the sdlc pack (CC30)', () => {
+    // .archon/workflows/sdlc/.shared/forge.ts and ci-note/check-ci/publish-* read
+    // ARCHON_SDLC_FORGE (and the server-published ARCHON_CLI_COMMAND) from the host
+    // environment, which the dag executor spreads into script nodes.
+    const result = parseWorkflow(
+      `name: sdlc-forge-switch
+description: Host operator switches are provided by the engine on host runs
+nodes:
+  - id: publish
+    script: |
+      const source = process.env.ARCHON_SDLC_FORGE ?? 'gh';
+      const cli = process.env.ARCHON_CLI_COMMAND;
+      console.log(source, cli);
+    runtime: bun
+`,
+      'sdlc-forge-switch.yaml'
+    );
+
+    expect(result.workflow).not.toBeNull();
+    expect(result.warnings).toEqual([]);
+  });
+
   test('bash reads can use declared inputs but not an ignored local with binding', () => {
     const declared = parseWorkflow(
       `name: bash-declared
