@@ -325,10 +325,19 @@ describe('TelegramAdapter', () => {
           return new Promise(() => {});
         });
       (adapter.getBot() as unknown as { start: typeof mockStart }).start = mockStart;
+      // CC25 (aion-custom) calls api.deleteWebhook() before every attempt (3) and
+      // again inside each 409 retry branch (2); without a mock it rejects (fake
+      // token) and logs telegram.delete_webhook_failed, which would add 3 warns to
+      // the 2 retry warns asserted below.
+      const mockDeleteWebhook = mock(() => Promise.resolve(true as const));
+      (
+        adapter.getBot().api as unknown as { deleteWebhook: typeof mockDeleteWebhook }
+      ).deleteWebhook = mockDeleteWebhook;
 
       await adapter.start({ retryDelayMs: 0 });
 
       expect(mockStart).toHaveBeenCalledTimes(3);
+      expect(mockDeleteWebhook).toHaveBeenCalledTimes(5);
       expect(mockLogger.warn).toHaveBeenCalledTimes(2);
     });
 
